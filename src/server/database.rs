@@ -11,7 +11,7 @@ impl Database {
         let default_pool = PgPool::connect(base_url).await.expect("Failed to connect to PostgreSQL");
 
         // Generate a unique database name
-        let db_name = format!("tempdb_{}", Uuid::new_v4().to_string().replace("-", "_"));
+        let db_name = format!("omnipaxos_tempdb_{}", Uuid::new_v4().to_string().replace("-", "_"));
 
         // Create a new temporary database
         let create_db_query = format!("CREATE DATABASE {}", db_name);
