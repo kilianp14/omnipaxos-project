@@ -64,7 +64,7 @@ pub mod sql {
     pub struct SqlCommand {
         pub query_type: QueryType,
         pub table: String,
-        pub columns: Vec<String>,
+        pub columns: Vec<(String, String)>, // this is column name, type
         pub values: Option<Vec<String>>,
         pub conditions: Option<String>,
         pub consistency: Option<Consistency>,
@@ -76,6 +76,7 @@ pub mod sql {
         Insert,
         Update,
         Delete,
+        Create,
     }
     
     #[derive(Debug, Clone, Serialize, Deserialize)]
