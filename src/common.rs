@@ -26,20 +26,10 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
-        Write(CommandId),
-        Read(CommandId, Option<String>),
+        Answer(CommandId, Option<String>),
         StartSignal(Timestamp),
     }
 
-    impl ServerMessage {
-        pub fn command_id(&self) -> CommandId {
-            match self {
-                ServerMessage::Write(id) => *id,
-                ServerMessage::Read(id, _) => *id,
-                ServerMessage::StartSignal(_) => unimplemented!(),
-            }
-        }
-    }
 }
 
 pub mod sql {

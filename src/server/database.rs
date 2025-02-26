@@ -1,14 +1,30 @@
 use omnipaxos_sql::common::sql::{SqlCommand, QueryType};
-use sqlx::{postgres::PgQueryResult, query, query_as, PgPool};
+use sqlx::{postgres::PgQueryResult, query, query_as, PgPool, Executor};
+use uuid::Uuid;
 
 pub struct Database {
     pool: PgPool,
+    db_name: String,
 }
 
 impl Database {
-    pub async fn new(database_url: &str) -> Self {
-        let pool = PgPool::connect(database_url).await.expect("Failed to connect to database");
-        Database { pool }
+    pub async fn new(base_url: &str) -> Self {
+        let default_pool = PgPool::connect(base_url).await.expect("Failed to connect to PostgreSQL");
+
+        // Generate a unique database name
+        let db_name = format!("tempdb_{}", Uuid::new_v4());
+
+        // Create a new temporary database
+        let create_db_query = format!("CREATE DATABASE {}", db_name);
+        default_pool.execute(create_db_query.as_str()).await.expect("Failed to create temp database");
+
+        // Construct new database URL
+        let temp_db_url = format!("{}/{}", base_url, db_name);
+
+        // Connect to the new temporary database
+        let temp_pool = PgPool::connect(&temp_db_url).await.expect("Failed to connect to temp database");
+
+        Database { pool: temp_pool, db_name }
     }
 
     pub async fn handle_command(&self, command: SqlCommand) -> Option<String> {
@@ -117,4 +133,13 @@ impl Database {
             None => None,
         }
     }    
+
+    pub async fn cleanup(&self, base_url: &str) {
+        // Connect to default DB again
+        let default_pool = PgPool::connect(base_url).await.expect("Failed to connect to PostgreSQL");
+
+        // Drop the temporary database
+        let drop_db_query = format!("DROP DATABASE IF EXISTS {}", self.db_name);
+        default_pool.execute(drop_db_query.as_str()).await.expect("Failed to drop temp database");
+    }
 }
