@@ -21,7 +21,7 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClientMessage {
-        Append(CommandId, SqlCommand),
+        Handle(CommandId, SqlCommand),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,8 +63,11 @@ pub mod sql {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct SqlCommand {
         pub query_type: QueryType,
-        pub request: QueryRequest,
-        pub consistency: Consistency,
+        pub table: String,
+        pub columns: Vec<String>,
+        pub values: Option<Vec<String>>,
+        pub conditions: Option<String>,
+        pub consistency: Option<Consistency>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,15 +78,6 @@ pub mod sql {
         Delete,
     }
     
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct QueryRequest {
-        pub query_type: QueryType,
-        pub table: String,
-        pub columns: Vec<String>,       // Columns to select or update
-        pub values: Option<Vec<String>>, // Values for INSERT/UPDATE
-        pub conditions: Option<String>, // WHERE clause (safe parameterized)
-    }
-
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum Consistency {
         Leader,

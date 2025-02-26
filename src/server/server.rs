@@ -134,7 +134,10 @@ impl OmniPaxosServer {
 
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         // TODO: batching responses possible here (batch at handle_cluster_messages)
+        // This todo was already in the repo, dont think we actually need to do batching
+        // For now lets just do write-through
         for command in commands {
+            // TODO: For now handle_command performes a local read
             let read = self.database.handle_command(command.sql_cmd);
             if command.coordinator_id == self.id {
                 let response = match read {
@@ -159,12 +162,27 @@ impl OmniPaxosServer {
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Append(command_id, sql_command) => {
-                    self.append_to_log(from, command_id, sql_command)
+                ClientMessage::Handle(command_id, sql_command) => {
+                    match sql_command.query_type {
+                        QueryType::Select => {
+                            self.handle_read_message(from, command_id, sql_command);
+                        },
+                        _ => self.append_to_log(from, command_id, sql_command),
+                    }
                 }
             }
         }
         self.send_outgoing_msgs();
+    }
+    
+    async fn handle_read_message(&mut self, client_id: ClientId, command_id: CommandId, sql_command: SqlCommand) {
+        // TODO: For now we ignore consistency levels when reading, and just do local read every time
+        let read = self.database.handle_command(sql_command);
+        let response = match read {
+            Some(read_result) => ServerMessage::Read(command_id, read_result),
+            None => ServerMessage::Write(command_id),
+        };
+        self.network.send_to_client(client_id, response);
     }
 
     async fn handle_cluster_messages(
