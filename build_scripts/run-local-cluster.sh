@@ -7,6 +7,7 @@ rust_log="info"
 # Clean up child processes
 interrupt() {
     pkill -P $$
+    psql -U postgres -d postgres -t -c "SELECT datname FROM pg_database WHERE datname NOT IN ('postgres', 'template0', 'template1');" | xargs -I{} psql -U postgres -d postgres -c "DROP DATABASE \"{}\";"
 }
 trap "interrupt" SIGINT
 

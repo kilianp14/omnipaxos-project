@@ -4,7 +4,6 @@ use uuid::Uuid;
 
 pub struct Database {
     pool: PgPool,
-    db_name: String,
 }
 
 impl Database {
@@ -12,7 +11,7 @@ impl Database {
         let default_pool = PgPool::connect(base_url).await.expect("Failed to connect to PostgreSQL");
 
         // Generate a unique database name
-        let db_name = format!("tempdb_{}", Uuid::new_v4());
+        let db_name = format!("tempdb_{}", Uuid::new_v4().to_string().replace("-", "_"));
 
         // Create a new temporary database
         let create_db_query = format!("CREATE DATABASE {}", db_name);
@@ -24,7 +23,7 @@ impl Database {
         // Connect to the new temporary database
         let temp_pool = PgPool::connect(&temp_db_url).await.expect("Failed to connect to temp database");
 
-        Database { pool: temp_pool, db_name }
+        Database { pool: temp_pool }
     }
 
     pub async fn handle_command(&self, command: SqlCommand) -> Option<String> {
@@ -133,13 +132,4 @@ impl Database {
             None => None,
         }
     }    
-
-    pub async fn cleanup(&self, base_url: &str) {
-        // Connect to default DB again
-        let default_pool = PgPool::connect(base_url).await.expect("Failed to connect to PostgreSQL");
-
-        // Drop the temporary database
-        let drop_db_query = format!("DROP DATABASE IF EXISTS {}", self.db_name);
-        default_pool.execute(drop_db_query.as_str()).await.expect("Failed to drop temp database");
-    }
 }
