@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosKVConfig, server::OmniPaxosServer};
+use crate::{configs::OmniPaxosSqlConfig, server::OmniPaxosServer};
 use env_logger;
 
 mod configs;
@@ -9,7 +9,7 @@ mod server;
 #[tokio::main]
 pub async fn main() {
     env_logger::init();
-    let server_config = match OmniPaxosKVConfig::new() {
+    let server_config = match OmniPaxosSqlConfig::new() {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };

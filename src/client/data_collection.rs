@@ -2,7 +2,7 @@ use std::{fs::File, io::Write};
 
 use chrono::Utc;
 use csv::Writer;
-use omnipaxos_kv::common::{kv::CommandId, utils::Timestamp};
+use omnipaxos_sql::common::{sql::CommandId, utils::Timestamp};
 use serde::Serialize;
 
 use crate::configs::ClientConfig;

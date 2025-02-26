@@ -1,7 +1,7 @@
 use crate::{configs::ClientConfig, data_collection::ClientData, network::Network};
 use chrono::Utc;
 use log::*;
-use omnipaxos_kv::common::{kv::*, messages::*};
+use omnipaxos_kv::common::{sql::*, messages::*};
 use rand::Rng;
 use std::time::Duration;
 use tokio::time::interval;

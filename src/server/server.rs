@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
+use crate::{configs::OmniPaxosSqlConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -6,7 +6,7 @@ use omnipaxos::{
     util::{LogEntry, NodeId},
     OmniPaxos, OmniPaxosConfig,
 };
-use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
+use omnipaxos_sql::common::{sql::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::{fs::File, io::Write, time::Duration};
 
@@ -22,12 +22,12 @@ pub struct OmniPaxosServer {
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
-    config: OmniPaxosKVConfig,
+    config: OmniPaxosSqlConfig,
     peers: Vec<NodeId>,
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosKVConfig) -> Self {
+    pub async fn new(config: OmniPaxosSqlConfig) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
@@ -135,7 +135,7 @@ impl OmniPaxosServer {
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         // TODO: batching responses possible here (batch at handle_cluster_messages)
         for command in commands {
-            let read = self.database.handle_command(command.kv_cmd);
+            let read = self.database.handle_command(command.sql_cmd);
             if command.coordinator_id == self.id {
                 let response = match read {
                     Some(read_result) => ServerMessage::Read(command.id, read_result),
@@ -159,8 +159,8 @@ impl OmniPaxosServer {
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Append(command_id, kv_command) => {
-                    self.append_to_log(from, command_id, kv_command)
+                ClientMessage::Append(command_id, sql_command) => {
+                    self.append_to_log(from, command_id, sql_command)
                 }
             }
         }
@@ -190,12 +190,12 @@ impl OmniPaxosServer {
         received_start_signal
     }
 
-    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand) {
+    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: SqlCommand) {
         let command = Command {
             client_id: from,
             coordinator_id: self.id,
             id: command_id,
-            kv_cmd: kv_command,
+            sql_cmd: sql_command,
         };
         self.omnipaxos
             .append(command)

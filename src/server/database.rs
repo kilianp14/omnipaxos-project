@@ -1,4 +1,4 @@
-use omnipaxos_kv::common::kv::KVCommand;
+use omnipaxos_sql::common::sql::SqlCommand;
 use std::collections::HashMap;
 
 pub struct Database {
@@ -10,7 +10,7 @@ impl Database {
         Self { db: HashMap::new() }
     }
 
-    pub fn handle_command(&mut self, command: KVCommand) -> Option<Option<String>> {
+    pub fn handle_command(&mut self, command: SqlCommand) -> Option<Option<String>> {
         match command {
             KVCommand::Put(key, value) => {
                 self.db.insert(key, value);
