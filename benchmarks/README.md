@@ -1,5 +1,5 @@
 # Omnipaxos-kv Benchmarks
-Benchmarking code for configuring and deploying omnipaxos-kv servers and clients to [GCP](https://cloud.google.com) as docker containers. Uses the GCP python client API to provison GCP instances. Then uses gcloud for authentication and starting servers/clients via SSHing into the provisioned instances. The project is currently setup to run an example benchmark using the omnipaxos-kv omnipaxos-server and omnipaxos-client images.
+Benchmarking code for configuring and deploying omnipaxos-kv servers and clients to [GCP](https://cloud.google.com) as docker containers. Uses the GCP python client API to provision GCP instances. Then uses gcloud for authentication and starting servers/clients via SSHing into the provisioned instances. The project is currently setup to run an example benchmark using the omnipaxos-kv omnipaxos-server and omnipaxos-client images.
 
 Documentation on the GCP python client API seems to be scarce. The best resource I've found are the samples [here](https://github.com/GoogleCloudPlatform/python-docs-samples/tree/main/compute).
 ## Prerequisites
