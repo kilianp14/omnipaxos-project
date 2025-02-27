@@ -1,7 +1,7 @@
 use crate::{configs::ClientConfig, data_collection::ClientData, network::Network};
 use chrono::Utc;
 use log::*;
-use omnipaxos_kv::common::{sql::*, messages::*};
+use omnipaxos_sql::common::{messages::*, sql::*};
 use rand::Rng;
 use std::time::Duration;
 use tokio::time::interval;
@@ -66,7 +66,7 @@ impl Client {
         info!("{}: Starting requests", self.id);
         loop {
             tokio::select! {
-                biased;
+                biased; // TODO: What is this?
                 Some(msg) = self.network.server_messages.recv() => {
                     self.handle_server_message(msg);
                     if self.run_finished() {
@@ -117,12 +117,17 @@ impl Client {
     }
 
     async fn send_request(&mut self, is_write: bool) {
-        let key = self.next_request_id.to_string();
-        let cmd = match is_write {
-            true => KVCommand::Put(key.clone(), key),
-            false => KVCommand::Get(key),
+        let _key = self.next_request_id.to_string();
+        // TODO: Just to make it compile.
+        let cmd = SqlCommand {
+            query_type: QueryType::Insert,
+            table: "test".to_string(),
+            columns: vec![("key".to_string(), "text".to_string())],
+            values: None,
+            conditions: None,
+            consistency: None,
         };
-        let request = ClientMessage::Append(self.next_request_id, cmd);
+        let request = ClientMessage::Handle(self.next_request_id, cmd);
         debug!("Sending {request:?}");
         self.network.send(self.active_server, request).await;
         self.client_data.new_request(is_write);
@@ -135,7 +140,7 @@ impl Client {
                 return true;
             }
         }
-        return false;
+        false
     }
 
     // Wait until the scheduled start time to synchronize client starts.

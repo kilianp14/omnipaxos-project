@@ -30,6 +30,14 @@ pub mod messages {
         StartSignal(Timestamp),
     }
 
+    impl ServerMessage {
+        pub fn command_id(&self) -> CommandId {
+            match self {
+                ServerMessage::Answer(id, _) => *id,
+                ServerMessage::StartSignal(_) => unimplemented!(),
+            }
+        }
+    }
 }
 
 pub mod sql {
@@ -68,7 +76,7 @@ pub mod sql {
         Delete,
         Create,
     }
-    
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum Consistency {
         Leader,
