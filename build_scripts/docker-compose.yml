@@ -13,6 +13,8 @@ services:
       context: ./..
       dockerfile: server.dockerfile
     container_name: s1
+    networks:
+      - backend
     environment:
       <<: *common-server-variables
     volumes:
@@ -22,6 +24,8 @@ services:
   s2:
     image: omnipaxos-server
     container_name: s2
+    networks:
+      - backend
     environment:
       <<: *common-server-variables
     volumes:
@@ -31,6 +35,8 @@ services:
   s3:
     image: omnipaxos-server
     container_name: s3
+    networks:
+      - backend
     environment:
       <<: *common-server-variables
     volumes:
@@ -43,6 +49,8 @@ services:
       context: ./..
       dockerfile: client.dockerfile
     container_name: c1
+    networks:
+      - backend
     environment:
       RUST_LOG: "debug"
       CONFIG_FILE: "/app/client-config.toml"
@@ -53,6 +61,8 @@ services:
   c2:
     image: omnipaxos-client
     container_name: c2
+    networks:
+      - backend
     environment:
       RUST_LOG: "debug"
       CONFIG_FILE: "/app/client-config.toml"
@@ -60,3 +70,7 @@ services:
     volumes:
       - ./client-2-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/
+
+networks:
+  backend:
+    driver: bridge
