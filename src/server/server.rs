@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
+use crate::{configs::OmniPaxosSqlConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -6,8 +6,9 @@ use omnipaxos::{
     util::{LogEntry, NodeId},
     OmniPaxos, OmniPaxosConfig,
 };
-use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
+use omnipaxos_sql::common::{messages::*, sql::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
+use std::sync::Arc;
 use std::{fs::File, io::Write, time::Duration};
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
@@ -17,17 +18,17 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct OmniPaxosServer {
     id: NodeId,
-    database: Database,
+    database: Arc<Database>,
     network: Network,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
-    config: OmniPaxosKVConfig,
+    config: OmniPaxosSqlConfig,
     peers: Vec<NodeId>,
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosKVConfig) -> Self {
+    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
@@ -37,7 +38,7 @@ impl OmniPaxosServer {
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         OmniPaxosServer {
             id: config.local.server_id,
-            database: Database::new(),
+            database: database,
             network,
             omnipaxos,
             current_decided_idx: 0,
@@ -111,7 +112,7 @@ impl OmniPaxosServer {
         }
     }
 
-    fn handle_decided_entries(&mut self) {
+    async fn handle_decided_entries(&mut self) {
         // TODO: Can use a read_raw here to avoid allocation
         let new_decided_idx = self.omnipaxos.get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
@@ -128,20 +129,20 @@ impl OmniPaxosServer {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands);
+            self.update_database_and_respond(decided_commands).await;
         }
     }
 
-    fn update_database_and_respond(&mut self, commands: Vec<Command>) {
+    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         // TODO: batching responses possible here (batch at handle_cluster_messages)
+        // This todo was already in the repo, dont think we actually need to do batching
+        // For now lets just do write-through
         for command in commands {
-            let read = self.database.handle_command(command.kv_cmd);
+            // TODO: For now handle_command performs a local read
+            let response = self.database.handle_command(command.sql_cmd).await;
             if command.coordinator_id == self.id {
-                let response = match read {
-                    Some(read_result) => ServerMessage::Read(command.id, read_result),
-                    None => ServerMessage::Write(command.id),
-                };
-                self.network.send_to_client(command.client_id, response);
+                let msg = ServerMessage::Answer(command.id, response);
+                self.network.send_to_client(command.client_id, msg);
             }
         }
     }
@@ -159,12 +160,28 @@ impl OmniPaxosServer {
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Append(command_id, kv_command) => {
-                    self.append_to_log(from, command_id, kv_command)
-                }
+                ClientMessage::Handle(command_id, sql_command) => match sql_command.query_type {
+                    QueryType::Select => {
+                        self.handle_read_message(from, command_id, sql_command)
+                            .await;
+                    }
+                    _ => self.append_to_log(from, command_id, sql_command),
+                },
             }
         }
         self.send_outgoing_msgs();
+    }
+
+    async fn handle_read_message(
+        &mut self,
+        client_id: ClientId,
+        command_id: CommandId,
+        sql_command: SqlCommand,
+    ) {
+        // TODO: For now we ignore consistency levels when reading, and just do local read every time
+        let response = self.database.handle_command(sql_command).await;
+        let msg = ServerMessage::Answer(command_id, response);
+        self.network.send_to_client(client_id, msg);
     }
 
     async fn handle_cluster_messages(
@@ -177,7 +194,7 @@ impl OmniPaxosServer {
             match message {
                 ClusterMessage::OmniPaxosMessage(m) => {
                     self.omnipaxos.handle_incoming(m);
-                    self.handle_decided_entries();
+                    self.handle_decided_entries().await;
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
                     debug!("Received start message from peer {from}");
@@ -190,12 +207,12 @@ impl OmniPaxosServer {
         received_start_signal
     }
 
-    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand) {
+    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: SqlCommand) {
         let command = Command {
             client_id: from,
             coordinator_id: self.id,
             id: command_id,
-            kv_cmd: kv_command,
+            sql_cmd: sql_command,
         };
         self.omnipaxos
             .append(command)

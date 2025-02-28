@@ -3,7 +3,7 @@ pub mod messages {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        kv::{Command, CommandId, KVCommand},
+        sql::{Command, CommandId, SqlCommand},
         utils::Timestamp,
     };
 
@@ -21,31 +21,31 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClientMessage {
-        Append(CommandId, KVCommand),
+        Handle(CommandId, SqlCommand),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
-        Write(CommandId),
-        Read(CommandId, Option<String>),
+        Answer(CommandId, Option<String>),
         StartSignal(Timestamp),
     }
 
     impl ServerMessage {
         pub fn command_id(&self) -> CommandId {
             match self {
-                ServerMessage::Write(id) => *id,
-                ServerMessage::Read(id, _) => *id,
+                ServerMessage::Answer(id, _) => *id,
                 ServerMessage::StartSignal(_) => unimplemented!(),
             }
         }
     }
 }
 
-pub mod kv {
-    use omnipaxos::{macros::Entry, storage::Snapshot};
+pub const TABLE_NAME: &str = "test_table";
+pub mod sql {
+    // use omnipaxos::{macros::Entry, storage::Snapshot};
+    use crate::common::TABLE_NAME;
+    use omnipaxos::macros::Entry;
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
 
     pub type CommandId = usize;
     pub type ClientId = u64;
@@ -57,62 +57,122 @@ pub mod kv {
         pub client_id: ClientId,
         pub coordinator_id: NodeId,
         pub id: CommandId,
-        pub kv_cmd: KVCommand,
+        pub sql_cmd: SqlCommand,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub enum KVCommand {
-        Put(String, String),
-        Delete(String),
-        Get(String),
+    pub struct SqlCommand {
+        pub query_type: QueryType,
+        pub table: String,
+        pub columns: Vec<(String, String)>, // this is column name, type
+        pub values: Option<Vec<String>>,
+        pub conditions: Option<String>,
+        pub consistency: Option<Consistency>,
     }
 
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub struct KVSnapshot {
-        snapshotted: HashMap<String, String>,
-        deleted_keys: Vec<String>,
-    }
-
-    impl Snapshot<Command> for KVSnapshot {
-        fn create(entries: &[Command]) -> Self {
-            let mut snapshotted = HashMap::new();
-            let mut deleted_keys: Vec<String> = Vec::new();
-            for e in entries {
-                match &e.kv_cmd {
-                    KVCommand::Put(key, value) => {
-                        snapshotted.insert(key.clone(), value.clone());
-                    }
-                    KVCommand::Delete(key) => {
-                        if snapshotted.remove(key).is_none() {
-                            // key was not in the snapshot
-                            deleted_keys.push(key.clone());
-                        }
-                    }
-                    KVCommand::Get(_) => (),
-                }
-            }
-            // remove keys that were put back
-            deleted_keys.retain(|k| !snapshotted.contains_key(k));
+    impl SqlCommand {
+        pub fn create_table_cmd() -> Self {
             Self {
-                snapshotted,
-                deleted_keys,
+                query_type: QueryType::Create,
+                table: TABLE_NAME.to_string(),
+                columns: vec![
+                    ("id".to_string(), "serial".to_string()),
+                    ("key".to_string(), "text".to_string()),
+                    ("value".to_string(), "text".to_string()),
+                ],
+                values: None,
+                conditions: None,
+                consistency: None,
+            }
+        }
+        pub fn insert_cmd(key: String) -> Self {
+            Self {
+                query_type: QueryType::Insert,
+                table: TABLE_NAME.to_string(),
+                columns: vec![
+                    ("key".to_string(), "text".to_string()),
+                    ("value".to_string(), "text".to_string()),
+                ],
+                values: Some(vec![key.clone(), format!("value_{}", key)]),
+                conditions: None,
+                consistency: None,
             }
         }
 
-        fn merge(&mut self, delta: Self) {
-            for (k, v) in delta.snapshotted {
-                self.snapshotted.insert(k, v);
+        pub fn select_cmd(key: String) -> Self {
+            Self {
+                query_type: QueryType::Select,
+                table: TABLE_NAME.to_string(),
+                columns: vec![("key".to_string(), "text".to_string())],
+                values: None,
+                conditions: Some(format!("'key' = '{}'", key)),
+                consistency: None,
             }
-            for k in delta.deleted_keys {
-                self.snapshotted.remove(&k);
-            }
-            self.deleted_keys.clear();
-        }
-
-        fn use_snapshots() -> bool {
-            true
         }
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Copy)]
+    pub enum QueryType {
+        Select,
+        Insert,
+        Update,
+        Delete,
+        Create,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum Consistency {
+        Leader,
+        Local,
+        Linearizable,
+    }
+
+    //#[derive(Clone, Debug, Serialize, Deserialize)]
+    //pub struct KVSnapshot {
+    //snapshotted: HashMap<String, String>,
+    //deleted_keys: Vec<String>,
+    //}
+
+    //impl Snapshot<Command> for KVSnapshot {
+    //fn create(entries: &[Command]) -> Self {
+    //let mut snapshotted = HashMap::new();
+    //let mut deleted_keys: Vec<String> = Vec::new();
+    //for e in entries {
+    //match &e.kv_cmd {
+    //KVCommand::Put(key, value) => {
+    //snapshotted.insert(key.clone(), value.clone());
+    //}
+    //KVCommand::Delete(key) => {
+    //if snapshotted.remove(key).is_none() {
+    //// key was not in the snapshot
+    //deleted_keys.push(key.clone());
+    //}
+    //}
+    //KVCommand::Get(_) => (),
+    //}
+    //}
+    //// remove keys that were put back
+    //deleted_keys.retain(|k| !snapshotted.contains_key(k));
+    //Self {
+    //snapshotted,
+    //deleted_keys,
+    //}
+    //}
+
+    //fn merge(&mut self, delta: Self) {
+    //for (k, v) in delta.snapshotted {
+    //self.snapshotted.insert(k, v);
+    //}
+    //for k in delta.deleted_keys {
+    //self.snapshotted.remove(&k);
+    //}
+    //self.deleted_keys.clear();
+    //}
+
+    //fn use_snapshots() -> bool {
+    //true
+    //}
+    //}
 }
 
 pub mod utils {

@@ -1,7 +1,7 @@
 use crate::{configs::ClientConfig, data_collection::ClientData, network::Network};
 use chrono::Utc;
 use log::*;
-use omnipaxos_kv::common::{kv::*, messages::*};
+use omnipaxos_sql::common::{messages::*, sql::*};
 use rand::Rng;
 use std::time::Duration;
 use tokio::time::interval;
@@ -45,7 +45,7 @@ impl Client {
             }
             _ => panic!("Error waiting for start signal"),
         }
-
+        self.send_request(QueryType::Create).await;
         // Early end
         let intervals = self.config.requests.clone();
         if intervals.is_empty() {
@@ -66,7 +66,7 @@ impl Client {
         info!("{}: Starting requests", self.id);
         loop {
             tokio::select! {
-                biased;
+                biased; // TODO: What is this?
                 Some(msg) = self.network.server_messages.recv() => {
                     self.handle_server_message(msg);
                     if self.run_finished() {
@@ -75,7 +75,12 @@ impl Client {
                 }
                 _ = request_interval.tick(), if self.final_request_count.is_none() => {
                     let is_write = rng.gen::<f64>() > read_ratio;
-                    self.send_request(is_write).await;
+                    let query_type = if is_write {
+                        QueryType::Insert
+                    } else {
+                        QueryType::Select
+                    };
+                    self.send_request(query_type).await;
                 },
                 _ = next_interval.tick() => {
                     match intervals.next() {
@@ -116,16 +121,17 @@ impl Client {
         }
     }
 
-    async fn send_request(&mut self, is_write: bool) {
+    async fn send_request(&mut self, query_type: QueryType) {
         let key = self.next_request_id.to_string();
-        let cmd = match is_write {
-            true => KVCommand::Put(key.clone(), key),
-            false => KVCommand::Get(key),
+        let cmd = match query_type {
+            QueryType::Create => SqlCommand::create_table_cmd(),
+            QueryType::Insert => SqlCommand::insert_cmd(key),
+            _ => SqlCommand::select_cmd(key),
         };
-        let request = ClientMessage::Append(self.next_request_id, cmd);
+        let request = ClientMessage::Handle(self.next_request_id, cmd);
         debug!("Sending {request:?}");
         self.network.send(self.active_server, request).await;
-        self.client_data.new_request(is_write);
+        self.client_data.new_request(query_type);
         self.next_request_id += 1;
     }
 
@@ -135,7 +141,7 @@ impl Client {
                 return true;
             }
         }
-        return false;
+        false
     }
 
     // Wait until the scheduled start time to synchronize client starts.

@@ -1,16 +1,16 @@
 use std::{fs::File, io::Write};
 
+use crate::configs::ClientConfig;
 use chrono::Utc;
 use csv::Writer;
-use omnipaxos_kv::common::{kv::CommandId, utils::Timestamp};
+use omnipaxos_sql::common::sql::QueryType;
+use omnipaxos_sql::common::{sql::CommandId, utils::Timestamp};
 use serde::Serialize;
-
-use crate::configs::ClientConfig;
 
 #[derive(Debug, Serialize, Clone, Copy)]
 struct RequestData {
     request_time: Timestamp,
-    write: bool,
+    query_type: QueryType,
     response_time: Option<Timestamp>,
 }
 
@@ -27,10 +27,10 @@ impl ClientData {
         }
     }
 
-    pub fn new_request(&mut self, is_write: bool) {
+    pub fn new_request(&mut self, query_type: QueryType) {
         let data = RequestData {
             request_time: Utc::now().timestamp_millis(),
-            write: is_write,
+            query_type,
             response_time: None,
         };
         self.request_data.push(data);

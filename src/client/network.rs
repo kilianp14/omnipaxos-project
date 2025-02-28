@@ -1,6 +1,6 @@
 use futures::{SinkExt, StreamExt};
 use log::*;
-use omnipaxos_kv::common::{kv::NodeId, messages::*, utils::*};
+use omnipaxos_sql::common::{messages::*, sql::NodeId, utils::*};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, channel};

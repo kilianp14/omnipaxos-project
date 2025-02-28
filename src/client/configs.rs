@@ -1,7 +1,7 @@
 use std::{env, time::Duration};
 
 use config::{Config, ConfigError, Environment, File};
-use omnipaxos_kv::common::{kv::NodeId, utils::Timestamp};
+use omnipaxos_sql::common::{sql::NodeId, utils::Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
