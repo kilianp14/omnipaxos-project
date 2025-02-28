@@ -33,7 +33,6 @@ impl Database {
         let temp_pool = PgPool::connect(&temp_db_url)
             .await
             .expect("Failed to connect to temp database");
-
         Database { pool: temp_pool }
     }
 
@@ -82,7 +81,12 @@ impl Database {
             .map(|(col, _)| col)
             .collect::<Vec<String>>()
             .join(", ");
-        let values = command.values?.join(", ");
+        let values: String = command
+            .values?
+            .iter()
+            .map(|i| format!("'{}'", i))
+            .collect::<Vec<String>>()
+            .join(", ");
         let query_str = format!(
             "INSERT INTO {} ({}) VALUES ({}) RETURNING id",
             command.table, columns, values
@@ -92,11 +96,12 @@ impl Database {
 
         match result {
             Some(res) => Some(format!("Inserted {} rows", res.rows_affected())),
-            None => None,
+            None => Some(format!("Failed to insert row with query {}", query_str)),
         }
     }
 
     async fn handle_update(&self, command: SqlCommand) -> Option<String> {
+        // FYI this is probably not required for this project.
         let assignments: Vec<String> = command
             .columns
             .into_iter()

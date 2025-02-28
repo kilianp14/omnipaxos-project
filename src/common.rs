@@ -40,8 +40,10 @@ pub mod messages {
     }
 }
 
+pub const TABLE_NAME: &str = "test_table";
 pub mod sql {
     // use omnipaxos::{macros::Entry, storage::Snapshot};
+    use crate::common::TABLE_NAME;
     use omnipaxos::macros::Entry;
     use serde::{Deserialize, Serialize};
 
@@ -68,7 +70,48 @@ pub mod sql {
         pub consistency: Option<Consistency>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    impl SqlCommand {
+        pub fn create_table_cmd() -> Self {
+            Self {
+                query_type: QueryType::Create,
+                table: TABLE_NAME.to_string(),
+                columns: vec![
+                    ("id".to_string(), "serial".to_string()),
+                    ("key".to_string(), "text".to_string()),
+                    ("value".to_string(), "text".to_string()),
+                ],
+                values: None,
+                conditions: None,
+                consistency: None,
+            }
+        }
+        pub fn insert_cmd(key: String) -> Self {
+            Self {
+                query_type: QueryType::Insert,
+                table: TABLE_NAME.to_string(),
+                columns: vec![
+                    ("key".to_string(), "text".to_string()),
+                    ("value".to_string(), "text".to_string()),
+                ],
+                values: Some(vec![key.clone(), format!("value_{}", key)]),
+                conditions: None,
+                consistency: None,
+            }
+        }
+
+        pub fn select_cmd(key: String) -> Self {
+            Self {
+                query_type: QueryType::Select,
+                table: TABLE_NAME.to_string(),
+                columns: vec![("key".to_string(), "text".to_string())],
+                values: None,
+                conditions: Some(format!("'key' = '{}'", key)),
+                consistency: None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Copy)]
     pub enum QueryType {
         Select,
         Insert,

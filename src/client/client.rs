@@ -45,7 +45,7 @@ impl Client {
             }
             _ => panic!("Error waiting for start signal"),
         }
-
+        self.send_request(QueryType::Create).await;
         // Early end
         let intervals = self.config.requests.clone();
         if intervals.is_empty() {
@@ -75,7 +75,12 @@ impl Client {
                 }
                 _ = request_interval.tick(), if self.final_request_count.is_none() => {
                     let is_write = rng.gen::<f64>() > read_ratio;
-                    self.send_request(is_write).await;
+                    let query_type = if is_write {
+                        QueryType::Insert
+                    } else {
+                        QueryType::Select
+                    };
+                    self.send_request(query_type).await;
                 },
                 _ = next_interval.tick() => {
                     match intervals.next() {
@@ -116,21 +121,17 @@ impl Client {
         }
     }
 
-    async fn send_request(&mut self, is_write: bool) {
-        let _key = self.next_request_id.to_string();
-        // TODO: Just to make it compile.
-        let cmd = SqlCommand {
-            query_type: QueryType::Insert,
-            table: "test".to_string(),
-            columns: vec![("key".to_string(), "text".to_string())],
-            values: None,
-            conditions: None,
-            consistency: None,
+    async fn send_request(&mut self, query_type: QueryType) {
+        let key = self.next_request_id.to_string();
+        let cmd = match query_type {
+            QueryType::Create => SqlCommand::create_table_cmd(),
+            QueryType::Insert => SqlCommand::insert_cmd(key),
+            _ => SqlCommand::select_cmd(key),
         };
         let request = ClientMessage::Handle(self.next_request_id, cmd);
         debug!("Sending {request:?}");
         self.network.send(self.active_server, request).await;
-        self.client_data.new_request(is_write);
+        self.client_data.new_request(query_type);
         self.next_request_id += 1;
     }
 
