@@ -1,8 +1,8 @@
 use futures::{SinkExt, StreamExt};
 use log::*;
 use omnipaxos_sql::common::{
-    sql::{ClientId, NodeId},
     messages::*,
+    sql::{ClientId, NodeId},
     utils::*,
 };
 use std::net::{SocketAddr, ToSocketAddrs};

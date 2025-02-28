@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosSqlConfig, server::OmniPaxosServer, database::Database};
+use crate::{configs::OmniPaxosSqlConfig, database::Database, server::OmniPaxosServer};
 use env_logger;
 use std::sync::Arc;
 
@@ -22,4 +22,3 @@ pub async fn main() {
     let mut server = OmniPaxosServer::new(server_config, db).await;
     server.run().await;
 }
-    
