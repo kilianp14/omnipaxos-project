@@ -66,7 +66,7 @@ impl Client {
         info!("{}: Starting requests", self.id);
         loop {
             tokio::select! {
-                biased; // TODO: What is this?
+                biased;
                 Some(msg) = self.network.server_messages.recv() => {
                     self.handle_server_message(msg);
                     if self.run_finished() {
@@ -122,11 +122,18 @@ impl Client {
     }
 
     async fn send_request(&mut self, query_type: QueryType) {
+        // Prevent subtract overflow
+        let prev_key = if self.next_request_id == 0 {
+            0
+        } else {
+            self.next_request_id - 1
+        };
         let key = self.next_request_id.to_string();
         let cmd = match query_type {
             QueryType::Create => SqlCommand::create_table_cmd(),
             QueryType::Insert => SqlCommand::insert_cmd(key),
-            _ => SqlCommand::select_cmd(key),
+            // It's not very interesting to select a key that doesn't exist.
+            _ => SqlCommand::select_cmd(prev_key.to_string()),
         };
         let request = ClientMessage::Handle(self.next_request_id, cmd);
         debug!("Sending {request:?}");

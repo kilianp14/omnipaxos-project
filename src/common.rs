@@ -105,7 +105,7 @@ pub mod sql {
                 table: TABLE_NAME.to_string(),
                 columns: vec![("key".to_string(), "text".to_string())],
                 values: None,
-                conditions: Some(format!("'key' = '{}'", key)),
+                conditions: Some(format!("key = '{}'", key)),
                 consistency: None,
             }
         }
