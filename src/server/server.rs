@@ -38,7 +38,7 @@ impl OmniPaxosServer {
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         OmniPaxosServer {
             id: config.local.server_id,
-            database: database,
+            database,
             network,
             omnipaxos,
             current_decided_idx: 0,
@@ -121,7 +121,6 @@ impl OmniPaxosServer {
                 .read_decided_suffix(self.current_decided_idx)
                 .unwrap();
             self.current_decided_idx = new_decided_idx;
-            debug!("Decided {new_decided_idx}");
             let decided_commands = decided_entries
                 .into_iter()
                 .filter_map(|e| match e {
@@ -138,7 +137,6 @@ impl OmniPaxosServer {
         // This todo was already in the repo, dont think we actually need to do batching
         // For now lets just do write-through
         for command in commands {
-            // TODO: For now handle_command performs a local read
             let response = self.database.handle_command(command.sql_cmd).await;
             if command.coordinator_id == self.id {
                 let msg = ServerMessage::Answer(command.id, response);
@@ -178,10 +176,57 @@ impl OmniPaxosServer {
         command_id: CommandId,
         sql_command: SqlCommand,
     ) {
-        // TODO: For now we ignore consistency levels when reading, and just do local read every time
-        let response = self.database.handle_command(sql_command).await;
-        let msg = ServerMessage::Answer(command_id, response);
-        self.network.send_to_client(client_id, msg);
+        match sql_command
+            .consistency
+            .clone()
+            .unwrap_or(Consistency::Local)
+        {
+            Consistency::Local => {
+                // Read from local DB directly
+                let response = self.database.handle_command(sql_command).await;
+                let msg = ServerMessage::Answer(command_id, response);
+                self.network.send_to_client(client_id, msg);
+            }
+            Consistency::Leader => {
+                if let Some((leader_id, is_accept_phase)) = self.omnipaxos.get_current_leader() {
+                    if leader_id == self.id && is_accept_phase {
+                        // We are the leader, process locally
+                        let response = self.database.handle_command(sql_command).await;
+                        let msg = ServerMessage::Answer(command_id, response);
+                        self.network.send_to_client(client_id, msg);
+                    } else {
+                        // Forward to leader
+                        let forward_msg =
+                            ClusterMessage::ReadRequest(client_id, command_id, sql_command);
+                        self.network.send_to_cluster(leader_id, forward_msg);
+                    }
+                }
+            }
+            Consistency::Linearizable => {
+                // For linearizable consistency, we can use a read-impose operation
+                // by appending a no-op or read operation to the log
+                let read_command = Command {
+                    client_id,
+                    coordinator_id: self.id,
+                    id: command_id,
+                    sql_cmd: sql_command,
+                };
+                // Append the read command to the log to ensure linearizability
+                match self.omnipaxos.append(read_command) {
+                    Ok(_) => {
+                        // TODO: Verify this works as expected.
+                        // The read will be processed when it's decided
+                        // No need to send response here as it will be sent
+                        // in update_database_and_respond when the command is decided
+                    }
+                    Err(e) => {
+                        let response = format!("Failed to achieve linearizable read: {:?}", e);
+                        let msg = ServerMessage::Answer(command_id, Some(response));
+                        self.network.send_to_client(client_id, msg);
+                    }
+                }
+            }
+        };
     }
 
     async fn handle_cluster_messages(
@@ -200,6 +245,20 @@ impl OmniPaxosServer {
                     debug!("Received start message from peer {from}");
                     received_start_signal = true;
                     self.send_client_start_signals(start_time);
+                }
+                ClusterMessage::ReadRequest(client_id, command_id, sql_command) => {
+                    if let Some((leader, is_accepted)) = self.omnipaxos.get_current_leader() {
+                        if leader == self.id && is_accepted {
+                            let response = self.database.handle_command(sql_command).await;
+                            let msg = ServerMessage::Answer(command_id, response);
+                            self.network.send_to_client(client_id, msg);
+                        } else {
+                            // Forward again if needed (in case of leader changes)
+                            let forward_msg =
+                                ClusterMessage::ReadRequest(client_id, command_id, sql_command);
+                            self.network.send_to_cluster(leader, forward_msg);
+                        }
+                    }
                 }
             }
         }

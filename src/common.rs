@@ -17,6 +17,7 @@ pub mod messages {
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
+        ReadRequest(NodeId, CommandId, SqlCommand),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
