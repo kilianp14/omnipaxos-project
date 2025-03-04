@@ -1,6 +1,6 @@
 location = "local-3"
 server_id = 3
-num_clients = 0 # Hardcoded number of client connections to wait for
+num_clients = 1 # Hardcoded number of client connections to wait for
 listen_address = "127.0.0.1"
 listen_port = 8003
 output_filepath = "./logs/server-3.json"
