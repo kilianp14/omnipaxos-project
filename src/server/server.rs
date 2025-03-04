@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosSqlConfig, database::Database, network::Network};
+use crate::{configs::OmniPaxosSqlConfig, database::Database, network::{self, Network, NetworkTrait}};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -19,7 +19,7 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct OmniPaxosServer {
     id: NodeId,
     database: Arc<Database>,
-    network: Network,
+    network: Box<dyn NetworkTrait>,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
@@ -28,14 +28,14 @@ pub struct OmniPaxosServer {
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>) -> Self {
+    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>, network:  Box<dyn NetworkTrait>) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         // Waits for client and server network connections to be established
-        let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
+        // let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         OmniPaxosServer {
             id: config.local.server_id,
             database,

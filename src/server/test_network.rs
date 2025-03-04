@@ -17,52 +17,7 @@ use tokio::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::configs::OmniPaxosSqlConfig;
-use async_trait::async_trait;
 
-#[async_trait]
-pub trait NetworkTrait {
-    async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self
-    where
-        Self: Sized;
-
-    async fn initialize_connections(
-        &mut self,
-        id: NodeId,
-        num_clients: usize,
-        peers: Vec<(NodeId, SocketAddr)>,
-        listen_address: SocketAddr,
-    );
-
-    fn spawn_connection_listener(
-        &self,
-        connection_sender: Sender<NewConnection>,
-        listen_address: SocketAddr,
-    ) -> tokio::task::JoinHandle<()>;
-
-    async fn handle_incoming_connection(
-        connection: TcpStream,
-        client_message_sender: Sender<(ClientId, ClientMessage)>,
-        cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
-        connection_sender: Sender<NewConnection>,
-        max_client_id_handle: Arc<Mutex<ClientId>>,
-        batch_size: usize,
-    );
-
-    fn spawn_peer_connectors(
-        &self,
-        connection_sender: Sender<NewConnection>,
-        my_id: NodeId,
-        peers: Vec<(NodeId, SocketAddr)>,
-    );
-
-    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage);
-
-    fn send_to_client(&mut self, to: ClientId, msg: ServerMessage);
-
-    fn shutdown(&mut self);
-
-    fn cluster_id_to_idx(&self, id: NodeId) -> Option<usize>;
-}
 pub struct Network {
     peers: Vec<NodeId>,
     peer_connections: Vec<Option<PeerConnection>>,
@@ -95,11 +50,10 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
     (listen_address, node_addresses)
 }
 
-#[async_trait]
-impl NetworkTrait for Network {
+impl Network {
     // Creates a new network with connections other server nodes in the cluster and any clients.
     // Waits until connections to all servers and clients are established before resolving.
-    async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self {
+    pub async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self {
         let (listen_address, node_addresses) = get_addrs(config.clone());
         let id = config.local.server_id;
         let peer_addresses: Vec<(NodeId, SocketAddr)> = config
@@ -164,35 +118,35 @@ impl NetworkTrait for Network {
     }
 
     fn spawn_connection_listener(
-            &self,
-            connection_sender: Sender<NewConnection>,
-            listen_address: SocketAddr,
-        ) -> tokio::task::JoinHandle<()> {
-            let client_sender = self.client_message_sender.clone();
-            let cluster_sender = self.cluster_message_sender.clone();
-            let max_client_id_handle = self.max_client_id.clone();
-            let batch_size = self.batch_size;
-            tokio::spawn(async move {
-                let listener = TcpListener::bind(listen_address).await.unwrap();
-                loop {
-                    match listener.accept().await {
-                        Ok((tcp_stream, socket_addr)) => {
-                            info!("New connection from {socket_addr}");
-                            tcp_stream.set_nodelay(true).unwrap();
-                            tokio::spawn(Network::handle_incoming_connection(
-                                tcp_stream,
-                                client_sender.clone(),
-                                cluster_sender.clone(),
-                                connection_sender.clone(),
-                                max_client_id_handle.clone(),
-                                batch_size,
-                            ));
-                        }
-                        Err(e) => error!("Error listening for new connection: {:?}", e),
+        &self,
+        connection_sender: Sender<NewConnection>,
+        listen_address: SocketAddr,
+    ) -> tokio::task::JoinHandle<()> {
+        let client_sender = self.client_message_sender.clone();
+        let cluster_sender = self.cluster_message_sender.clone();
+        let max_client_id_handle = self.max_client_id.clone();
+        let batch_size = self.batch_size;
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(listen_address).await.unwrap();
+            loop {
+                match listener.accept().await {
+                    Ok((tcp_stream, socket_addr)) => {
+                        info!("New connection from {socket_addr}");
+                        tcp_stream.set_nodelay(true).unwrap();
+                        tokio::spawn(Self::handle_incoming_connection(
+                            tcp_stream,
+                            client_sender.clone(),
+                            cluster_sender.clone(),
+                            connection_sender.clone(),
+                            max_client_id_handle.clone(),
+                            batch_size,
+                        ));
                     }
+                    Err(e) => error!("Error listening for new connection: {:?}", e),
                 }
-            })
-        }
+            }
+        })
+    }
 
     async fn handle_incoming_connection(
         connection: TcpStream,
@@ -288,7 +242,7 @@ impl NetworkTrait for Network {
         }
     }
 
-    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
+    pub fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
         match self.cluster_id_to_idx(to) {
             Some(idx) => match &mut self.peer_connections[idx] {
                 Some(ref mut connection) => {
@@ -303,7 +257,7 @@ impl NetworkTrait for Network {
         }
     }
 
-    fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
+    pub fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
         match self.client_connections.get_mut(&to) {
             Some(connection) => {
                 if let Err(err) = connection.send(msg) {
@@ -317,7 +271,7 @@ impl NetworkTrait for Network {
 
     // Removes all client and peer connections and ends their corresponding tasks.
     #[allow(dead_code)]
-    fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) {
         for (_, client_connection) in self.client_connections.drain() {
             client_connection.close();
         }
