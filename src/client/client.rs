@@ -115,8 +115,8 @@ impl Client {
         match msg {
             ServerMessage::StartSignal(_) => (),
             server_response => {
-                let cmd_id = server_response.command_id();
-                self.client_data.new_response(cmd_id);
+                let (cmd_id , response)= server_response.command_id();
+                self.client_data.new_response(cmd_id, response);
             }
         }
     }
@@ -136,10 +136,11 @@ impl Client {
             // TODO use different consistency levels for reads.
             _ => SqlCommand::select_cmd(prev_key.to_string()),
         };
-        let request = ClientMessage::Handle(self.next_request_id, cmd);
+        let request = ClientMessage::Handle(self.next_request_id, cmd.clone());
         debug!("Sending {request:?}");
         self.network.send(self.active_server, request).await;
-        self.client_data.new_request(query_type);
+        self.client_data
+            .new_request(cmd, self.next_request_id);
         self.next_request_id += 1;
     }
 

@@ -32,9 +32,9 @@ pub mod messages {
     }
 
     impl ServerMessage {
-        pub fn command_id(&self) -> CommandId {
+        pub fn command_id(&self) -> (CommandId , Option<String>) {
             match self {
-                ServerMessage::Answer(id, _) => *id,
+                ServerMessage::Answer(id, s) => (*id, s.clone()),
                 ServerMessage::StartSignal(_) => unimplemented!(),
             }
         }
@@ -104,7 +104,7 @@ pub mod sql {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
-                columns: vec![("key".to_string(), "text".to_string())],
+                columns: vec![("value".to_string(), "text".to_string())],
                 values: None,
                 conditions: Some(format!("key = '{}'", key)),
                 consistency: None,
