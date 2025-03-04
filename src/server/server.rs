@@ -261,22 +261,6 @@ impl OmniPaxosServer {
                     let msg = ServerMessage::Answer(command_id, response);
                     self.network.send_to_client(client_id, msg);
                 }
-                // if let Some((leader, is_accepted)) = self.omnipaxos.get_current_leader() {
-                  //     if leader == self.id && is_accepted {
-                  //     let response = self.database.handle_command(sql_command).await;
-                  //     let msg = servermessage::answer(command_id, response);
-                  //         self.network.send_to_client(client_id, msg);
-                  // }
-                  // else {
-                  //     // Forward again if needed (in case of leader changes)
-                  //     let forward_msg = ClusterMessage::ReadRequest(
-                  //         client_id,
-                  //         sender_id,
-                  //         command_id,
-                  //         sql_command,
-                  //     );
-                  //     self.network.send_to_cluster(leader, forward_msg);
-                  // }
             }
         }
         self.send_outgoing_msgs();
