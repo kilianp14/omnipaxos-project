@@ -196,8 +196,14 @@ impl OmniPaxosServer {
                         self.network.send_to_client(client_id, msg);
                     } else {
                         // Forward to leader
-                        let forward_msg =
-                            ClusterMessage::ReadRequest(client_id, command_id, sql_command);
+                        let forward_msg = ClusterMessage::ReadRequest(
+                            client_id,
+                            self.id,
+                            command_id,
+                            sql_command,
+                        );
+                        info!("{}: Forwarding read request to leader {}", self.id, leader_id);
+
                         self.network.send_to_cluster(leader_id, forward_msg);
                     }
                 }
@@ -246,20 +252,31 @@ impl OmniPaxosServer {
                     received_start_signal = true;
                     self.send_client_start_signals(start_time);
                 }
-                ClusterMessage::ReadRequest(client_id, command_id, sql_command) => {
-                    if let Some((leader, is_accepted)) = self.omnipaxos.get_current_leader() {
-                        if leader == self.id && is_accepted {
-                            let response = self.database.handle_command(sql_command).await;
-                            let msg = ServerMessage::Answer(command_id, response);
-                            self.network.send_to_client(client_id, msg);
-                        } else {
-                            // Forward again if needed (in case of leader changes)
-                            let forward_msg =
-                                ClusterMessage::ReadRequest(client_id, command_id, sql_command);
-                            self.network.send_to_cluster(leader, forward_msg);
-                        }
-                    }
+                ClusterMessage::ReadRequest(client_id, sender_id, command_id, sql_command) => {
+                    let response = self.database.handle_command(sql_command).await;
+                    let msg = ClusterMessage::ReadResponse(client_id, command_id, response);
+                    self.network.send_to_cluster(sender_id, msg);
                 }
+                ClusterMessage::ReadResponse(client_id, command_id, response) => {
+                    let msg = ServerMessage::Answer(command_id, response);
+                    self.network.send_to_client(client_id, msg);
+                }
+                // if let Some((leader, is_accepted)) = self.omnipaxos.get_current_leader() {
+                  //     if leader == self.id && is_accepted {
+                  //     let response = self.database.handle_command(sql_command).await;
+                  //     let msg = servermessage::answer(command_id, response);
+                  //         self.network.send_to_client(client_id, msg);
+                  // }
+                  // else {
+                  //     // Forward again if needed (in case of leader changes)
+                  //     let forward_msg = ClusterMessage::ReadRequest(
+                  //         client_id,
+                  //         sender_id,
+                  //         command_id,
+                  //         sql_command,
+                  //     );
+                  //     self.network.send_to_cluster(leader, forward_msg);
+                  // }
             }
         }
         self.send_outgoing_msgs();

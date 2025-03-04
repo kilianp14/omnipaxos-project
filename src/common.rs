@@ -17,7 +17,8 @@ pub mod messages {
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
-        ReadRequest(NodeId, CommandId, SqlCommand),
+        ReadRequest(NodeId, NodeId, CommandId, SqlCommand),
+        ReadResponse(NodeId, CommandId, Option<String>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,7 +33,7 @@ pub mod messages {
     }
 
     impl ServerMessage {
-        pub fn command_id(&self) -> (CommandId , Option<String>) {
+        pub fn command_id(&self) -> (CommandId, Option<String>) {
             match self {
                 ServerMessage::Answer(id, s) => (*id, s.clone()),
                 ServerMessage::StartSignal(_) => unimplemented!(),
@@ -86,7 +87,7 @@ pub mod sql {
                 consistency: None,
             }
         }
-        pub fn insert_cmd(key: String) -> Self {
+        pub fn insert_cmd(client_id: String, key: String) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
@@ -94,20 +95,20 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
-                values: Some(vec![key.clone(), format!("value_{}", key)]),
+                values: Some(vec![key.clone(), format!("{}_value_{}", client_id, key)]),
                 conditions: None,
                 consistency: None,
             }
         }
 
-        pub fn select_cmd(key: String) -> Self {
+        pub fn select_cmd(key: String, consistency: Consistency) -> Self {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
                 columns: vec![("value".to_string(), "text".to_string())],
                 values: None,
                 conditions: Some(format!("key = '{}'", key)),
-                consistency: None,
+                consistency: Some(consistency),
             }
         }
     }
