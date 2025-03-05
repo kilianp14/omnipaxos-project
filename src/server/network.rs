@@ -1,4 +1,5 @@
 use futures::{SinkExt, StreamExt};
+use async_trait::async_trait;
 use log::*;
 use omnipaxos_sql::common::{
     messages::*,
@@ -17,6 +18,14 @@ use tokio::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::configs::OmniPaxosSqlConfig;
+
+#[async_trait]
+pub trait NetworkTrait {
+    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage);
+    fn send_to_client(&mut self, client_id: ClientId, msg: ServerMessage);
+    async fn cluster_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClusterMessage)>, batch_size: usize) -> usize;
+    async fn client_recv_many(&mut self, buffer: &mut Vec<(ClientId, ClientMessage)>, batch_size: usize) -> usize;
+}
 
 pub struct Network {
     peers: Vec<NodeId>,
@@ -50,9 +59,47 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
     (listen_address, node_addresses)
 }
 
+#[async_trait]
+impl NetworkTrait for Network {
+
+    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
+        match self.cluster_id_to_idx(to) {
+            Some(idx) => match &mut self.peer_connections[idx] {
+                Some(ref mut connection) => {
+                    if let Err(err) = connection.send(msg) {
+                        warn!("Couldn't send msg to peer {to}: {err}");
+                        self.peer_connections[idx] = None;
+                    }
+                }
+                None => warn!("Not connected to node {to}"),
+            },
+            None => error!("Sending to unexpected node {to}"),
+        }
+    }
+
+    fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
+        match self.client_connections.get_mut(&to) {
+            Some(connection) => {
+                if let Err(err) = connection.send(msg) {
+                    warn!("Couldn't send msg to client {to}: {err}");
+                    self.client_connections.remove(&to);
+                }
+            }
+            None => warn!("Not connected to client {to}"),
+        }
+    }
+
+    async fn cluster_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClusterMessage)>, batch_size: usize) -> usize {
+        self.cluster_messages.recv_many(buffer, batch_size).await
+    }
+    
+    async fn client_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClientMessage)>, batch_size: usize) -> usize {
+        self.client_messages.recv_many(buffer, batch_size).await
+    }
+}
+
+
 impl Network {
-    // Creates a new network with connections other server nodes in the cluster and any clients.
-    // Waits until connections to all servers and clients are established before resolving.
     pub async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self {
         let (listen_address, node_addresses) = get_addrs(config.clone());
         let id = config.local.server_id;
@@ -239,33 +286,6 @@ impl Network {
                 let new_connection = NewConnection::ToPeer(peer_actor);
                 connection_sender.send(new_connection).await.unwrap();
             });
-        }
-    }
-
-    pub fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
-        match self.cluster_id_to_idx(to) {
-            Some(idx) => match &mut self.peer_connections[idx] {
-                Some(ref mut connection) => {
-                    if let Err(err) = connection.send(msg) {
-                        warn!("Couldn't send msg to peer {to}: {err}");
-                        self.peer_connections[idx] = None;
-                    }
-                }
-                None => warn!("Not connected to node {to}"),
-            },
-            None => error!("Sending to unexpected node {to}"),
-        }
-    }
-
-    pub fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
-        match self.client_connections.get_mut(&to) {
-            Some(connection) => {
-                if let Err(err) = connection.send(msg) {
-                    warn!("Couldn't send msg to client {to}: {err}");
-                    self.client_connections.remove(&to);
-                }
-            }
-            None => warn!("Not connected to client {to}"),
         }
     }
 
