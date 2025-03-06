@@ -1,4 +1,4 @@
-use omnipaxos_sql::common::sql::{QueryType, SqlCommand};
+use omnipaxos_sql::common::sql::{Phase, QueryType, SqlCommand, CommandId};
 use sqlx::{postgres::PgQueryResult, query, query_as, Executor, PgPool};
 use uuid::Uuid;
 
@@ -36,13 +36,31 @@ impl Database {
         Database { pool: temp_pool }
     }
 
-    pub async fn handle_command(&self, command: SqlCommand) -> Option<String> {
+    pub async fn commit_command(&self, transaction_id: CommandId) -> Option<String> {
+        let commit_query = format!("COMMIT PREPARED '{}'", transaction_id);
+        let response = query(&commit_query).execute(&self.pool).await.ok();
+        match response {
+            Some(res) => Some(format!("Committed Transaction {}", transaction_id)),
+            None => Some(format!("Failed to commit Transaction {}", transaction_id)),
+        }
+    }
+
+    pub async fn abort_command(&self, transaction_id: CommandId) -> Option<String> {
+        let abort_query = format!("ROLLBACK PREPARED '{}'", transaction_id);
+        let response = query(&abort_query).execute(&self.pool).await.ok();
+        match response {
+            Some(res) => Some(format!("Aborted Transaction {}", transaction_id)),
+            None => Some(format!("Failed to abort Transaction {}", transaction_id)),
+        }
+    }
+
+    pub async fn prepare_command(&self, command: SqlCommand, id:CommandId) -> Option<String> {
         match command.query_type {
             QueryType::Select => self.handle_select(command).await,
-            QueryType::Insert => self.handle_insert(command).await,
-            QueryType::Update => self.handle_update(command).await,
-            QueryType::Delete => self.handle_delete(command).await,
-            QueryType::Create => self.handle_create(command).await,
+            QueryType::Insert => self.handle_insert(command, id).await,
+            QueryType::Update => self.handle_update(command, id).await,
+            QueryType::Delete => self.handle_delete(command, id).await,
+            QueryType::Create => self.handle_create(command, id).await,
         }
     }
 
@@ -74,7 +92,7 @@ impl Database {
         }
     }
 
-    async fn handle_insert(&self, command: SqlCommand) -> Option<String> {
+    async fn handle_insert(&self, command: SqlCommand, id:CommandId) -> Option<String> {
         let columns = command
             .columns
             .into_iter()
@@ -88,8 +106,8 @@ impl Database {
             .collect::<Vec<String>>()
             .join(", ");
         let query_str = format!(
-            "INSERT INTO {} ({}) VALUES ({}) RETURNING id",
-            command.table, columns, values
+            "BEGIN; INSERT INTO {} ({}) VALUES ({}) RETURNING id; PREPARE TRANSACTION '{}';",
+            command.table, columns, values, id
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
@@ -100,7 +118,7 @@ impl Database {
         }
     }
 
-    async fn handle_update(&self, command: SqlCommand) -> Option<String> {
+    async fn handle_update(&self, command: SqlCommand, id:CommandId) -> Option<String> {
         // FYI this is probably not required for this project.
         let assignments: Vec<String> = command
             .columns
@@ -112,8 +130,8 @@ impl Database {
         let set_clause = assignments.join(", ");
         let condition = command.conditions.unwrap_or("TRUE".to_string());
         let query_str = format!(
-            "UPDATE {} SET {} WHERE {} RETURNING id",
-            command.table, set_clause, condition
+            "BEGIN; UPDATE {} SET {} WHERE {} RETURNING id; PREPARE TRANSACTION '{}';",
+            command.table, set_clause, condition, id
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
@@ -124,11 +142,11 @@ impl Database {
         }
     }
 
-    async fn handle_delete(&self, command: SqlCommand) -> Option<String> {
+    async fn handle_delete(&self, command: SqlCommand, id:CommandId) -> Option<String> {
         let condition = command.conditions.unwrap_or("TRUE".to_string());
         let query_str = format!(
-            "DELETE FROM {} WHERE {} RETURNING id",
-            command.table, condition
+            "BEGIN; DELETE FROM {} WHERE {} RETURNING id; PREPARE TRANSACTION '{}';",
+            command.table, condition, id
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
@@ -139,7 +157,7 @@ impl Database {
         }
     }
 
-    async fn handle_create(&self, command: SqlCommand) -> Option<String> {
+    async fn handle_create(&self, command: SqlCommand, id:CommandId) -> Option<String> {
         let columns_definitions: Vec<String> = command
             .columns
             .iter()
@@ -147,9 +165,10 @@ impl Database {
             .collect();
 
         let query_str = format!(
-            "CREATE TABLE IF NOT EXISTS {} ({})",
+            "BEGIN; CREATE TABLE IF NOT EXISTS {} ({}); PREPARE TRANSACTION '{}';",
             command.table,
-            columns_definitions.join(", ")
+            columns_definitions.join(", "),
+            id
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();

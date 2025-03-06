@@ -15,10 +15,10 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClusterMessage {
-        OmniPaxosMessage(OmniPaxosMessage<Command>),
-        LeaderStartSignal(Timestamp),
-        ReadRequest(NodeId, NodeId, CommandId, SqlCommand),
-        ReadResponse(NodeId, CommandId, Option<String>),
+        OmniPaxosMessage(OmniPaxosMessage<Command>, u32),
+        LeaderStartSignal(Timestamp, u32),
+        ReadRequest(NodeId, NodeId, CommandId, SqlCommand, u32),
+        ReadResponse(NodeId, CommandId, Option<String>, u32),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +60,14 @@ pub mod sql {
         pub coordinator_id: NodeId,
         pub id: CommandId,
         pub sql_cmd: SqlCommand,
+        pub phase: Option<Phase>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum Phase {
+        Prepare,
+        Commit,
+        Abort,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
