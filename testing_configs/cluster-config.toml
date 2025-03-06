@@ -1,0 +1,5 @@
+cluster_name = "local-cluster"
+nodes = [1, 2, 3]
+node_addrs = ["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003"]
+initial_leader = 1
+initial_flexible_quorum = { read_quorum_size = 2, write_quorum_size = 2 }

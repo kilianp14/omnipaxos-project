@@ -1,42 +1,49 @@
 use futures::{SinkExt, StreamExt};
 use async_trait::async_trait;
 use log::*;
+use omnipaxos::messages::{Message, sequence_paxos::{PaxosMessage, PaxosMsg, Decide}};
 use omnipaxos_sql::common::{
     messages::*,
     sql::{ClientId, NodeId},
-    utils::*,
 };
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio_serde::{formats::Bincode, Framed};
+use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
+use std::{net::{SocketAddr, ToSocketAddrs}, vec};
 use std::time::Duration;
-use std::{collections::HashMap, str::FromStr};
+use std::str::FromStr;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::Receiver,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+use serde::{Serialize, Deserialize};
 
-use crate::configs::OmniPaxosSqlConfig;
+use crate::{configs::OmniPaxosSqlConfig, network::NetworkTrait};
 
-#[async_trait]
-pub trait NetworkTrait {
-    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage);
-    fn send_to_client(&mut self, client_id: ClientId, msg: ServerMessage);
-    async fn cluster_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClusterMessage)>, batch_size: usize) -> usize;
-    async fn client_recv_many(&mut self, buffer: &mut Vec<(ClientId, ClientMessage)>, batch_size: usize) -> usize;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ServerAnswer {
+    ServerMessage(ServerMessage),
+    Decide(NodeId, ClusterMessage),
 }
 
-pub struct Network {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum CoordinatorMessage {
+    ClientMessage(ClientMessage),
+    ClusterMessage(ClusterMessage),
+}
+
+pub struct TestNetwork {
     peers: Vec<NodeId>,
     peer_connections: Vec<Option<PeerConnection>>,
-    client_connections: HashMap<ClientId, ClientConnection>,
-    max_client_id: Arc<Mutex<ClientId>>,
+    coordinator_connection: Option<CoordinatorConnection>,
     batch_size: usize,
-    client_message_sender: Sender<(ClientId, ClientMessage)>,
+    coordinator_message_sender: Sender<(ClientId, CoordinatorMessage)>,
     cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
     cluster_messages: Receiver<(NodeId, ClusterMessage)>,
-    client_messages: Receiver<(ClientId, ClientMessage)>,
+    coordinator_messages: Receiver<(ClientId, CoordinatorMessage)>,
+    pending_cluster_messages: Vec<(NodeId, ClusterMessage)>,
 }
 
 fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
@@ -60,46 +67,76 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
 }
 
 #[async_trait]
-impl NetworkTrait for Network {
+impl NetworkTrait for TestNetwork {
 
     fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
-        match self.cluster_id_to_idx(to) {
-            Some(idx) => match &mut self.peer_connections[idx] {
-                Some(ref mut connection) => {
-                    if let Err(err) = connection.send(msg) {
-                        warn!("Couldn't send msg to peer {to}: {err}");
-                        self.peer_connections[idx] = None;
+        if let ClusterMessage::OmniPaxosMessage(ref op_msg) = msg {
+            if let Message::SequencePaxos(PaxosMessage { from: _, to: node_id, msg: px_msg }) = op_msg {
+                if let PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) = px_msg {
+                    match &mut self.coordinator_connection {
+                        Some(ref mut connection) => {
+                            if let Err(err) = connection.send(ServerAnswer::Decide(*node_id, msg)) {
+                                warn!("Couldn't send msg to coordinator: {err}");
+                                self.coordinator_connection = None;
+                            }
+                        }
+                        None => warn!("Not connected to coordinator"),
                     }
                 }
-                None => warn!("Not connected to node {to}"),
-            },
-            None => error!("Sending to unexpected node {to}"),
+            }
+        }
+        else {
+            match self.cluster_id_to_idx(to) {
+                Some(idx) => match &mut self.peer_connections[idx] {
+                    Some(ref mut connection) => {
+                        if let Err(err) = connection.send(msg) {
+                            warn!("Couldn't send msg to peer {to}: {err}");
+                            self.peer_connections[idx] = None;
+                        }
+                    }
+                    None => warn!("Not connected to node {to}"),
+                },
+                None => error!("Sending to unexpected node {to}"),
+            }
         }
     }
 
     fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
-        match self.client_connections.get_mut(&to) {
+        match &mut self.coordinator_connection {
             Some(connection) => {
-                if let Err(err) = connection.send(msg) {
-                    warn!("Couldn't send msg to client {to}: {err}");
-                    self.client_connections.remove(&to);
+                if let Err(err) = connection.send(ServerAnswer::ServerMessage(msg)) {
+                    warn!("Couldn't send msg to coordinator {to}: {err}");
                 }
             }
-            None => warn!("Not connected to client {to}"),
+            None => warn!("Not connected to coordinator {to}"),
         }
     }
 
     async fn cluster_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClusterMessage)>, batch_size: usize) -> usize {
-        self.cluster_messages.recv_many(buffer, batch_size).await
+        self.cluster_messages.recv_many(buffer, batch_size).await;
+        buffer.append(&mut self.pending_cluster_messages);
+        buffer.len()
     }
     
     async fn client_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClientMessage)>, batch_size: usize) -> usize {
-        self.client_messages.recv_many(buffer, batch_size).await
+        let mut temp_buffer: Vec<(NodeId, CoordinatorMessage)> = Vec::with_capacity(batch_size);
+        self.coordinator_messages.recv_many(&mut temp_buffer, batch_size).await;
+        for message in temp_buffer {
+            match message {
+                (id, CoordinatorMessage::ClientMessage(client_msg)) => {
+                    buffer.push((id, client_msg));
+                },
+                (id, CoordinatorMessage::ClusterMessage(cluster_msg)) => {
+                    self.pending_cluster_messages.push((id, cluster_msg));
+                }
+            }
+        }
+        buffer.len()
     }
 }
 
 
-impl Network {
+impl TestNetwork {
     pub async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self {
         let (listen_address, node_addresses) = get_addrs(config.clone());
         let id = config.local.server_id;
@@ -113,21 +150,21 @@ impl Network {
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peer_addresses.len(), Default::default);
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(batch_size);
-        let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(batch_size);
+        let (coordinator_message_sender, coordinator_messages) = tokio::sync::mpsc::channel(batch_size);
+        let pending_cluster_messages: Vec<(NodeId, ClusterMessage)> = Vec::with_capacity(100);
         let mut network = Self {
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
-            client_connections: HashMap::new(),
-            max_client_id: Arc::new(Mutex::new(0)),
+            coordinator_connection: None,
             batch_size,
-            client_message_sender,
+            coordinator_message_sender,
             cluster_message_sender,
             cluster_messages,
-            client_messages,
+            coordinator_messages,
+            pending_cluster_messages,
         };
-        let num_clients = config.local.num_clients;
         network
-            .initialize_connections(id, num_clients, peer_addresses, listen_address)
+            .initialize_connections(id, peer_addresses, listen_address)
             .await;
         network
     }
@@ -135,7 +172,6 @@ impl Network {
     async fn initialize_connections(
         &mut self,
         id: NodeId,
-        num_clients: usize,
         peers: Vec<(NodeId, SocketAddr)>,
         listen_address: SocketAddr,
     ) {
@@ -149,15 +185,13 @@ impl Network {
                     let peer_idx = self.cluster_id_to_idx(connection.peer_id).unwrap();
                     self.peer_connections[peer_idx] = Some(connection);
                 }
-                NewConnection::ToClient(connection) => {
-                    let _ = self
-                        .client_connections
-                        .insert(connection.client_id, connection);
+                NewConnection::ToCoordinator(connection) => {
+                    self.coordinator_connection = Some(connection);
                 }
             }
-            let all_clients_connected = self.client_connections.len() >= num_clients;
+            let coordinator_connected = self.coordinator_connection.is_some();
             let all_cluster_connected = self.peer_connections.iter().all(|c| c.is_some());
-            if all_clients_connected && all_cluster_connected {
+            if coordinator_connected && all_cluster_connected {
                 listener_handle.abort();
                 break;
             }
@@ -169,9 +203,8 @@ impl Network {
         connection_sender: Sender<NewConnection>,
         listen_address: SocketAddr,
     ) -> tokio::task::JoinHandle<()> {
-        let client_sender = self.client_message_sender.clone();
+        let client_sender = self.coordinator_message_sender.clone();
         let cluster_sender = self.cluster_message_sender.clone();
-        let max_client_id_handle = self.max_client_id.clone();
         let batch_size = self.batch_size;
         tokio::spawn(async move {
             let listener = TcpListener::bind(listen_address).await.unwrap();
@@ -185,7 +218,6 @@ impl Network {
                             client_sender.clone(),
                             cluster_sender.clone(),
                             connection_sender.clone(),
-                            max_client_id_handle.clone(),
                             batch_size,
                         ));
                     }
@@ -197,10 +229,9 @@ impl Network {
 
     async fn handle_incoming_connection(
         connection: TcpStream,
-        client_message_sender: Sender<(ClientId, ClientMessage)>,
+        client_message_sender: Sender<(ClientId, CoordinatorMessage)>,
         cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
         connection_sender: Sender<NewConnection>,
-        max_client_id_handle: Arc<Mutex<ClientId>>,
         batch_size: usize,
     ) {
         // Identify connector's ID and type by handshake
@@ -218,15 +249,9 @@ impl Network {
                 ))
             }
             Some(Ok(RegistrationMessage::ClientRegister)) => {
-                let next_client_id = {
-                    let mut max_client_id = max_client_id_handle.lock().unwrap();
-                    *max_client_id += 1;
-                    *max_client_id
-                };
-                info!("Identified connection from client {next_client_id}");
+                info!("Identified connection from coordinator");
                 let underlying_stream = registration_connection.into_inner().into_inner();
-                NewConnection::ToClient(ClientConnection::new(
-                    next_client_id,
+                NewConnection::ToCoordinator(CoordinatorConnection::new(
                     underlying_stream,
                     batch_size,
                     client_message_sender,
@@ -292,8 +317,8 @@ impl Network {
     // Removes all client and peer connections and ends their corresponding tasks.
     #[allow(dead_code)]
     pub fn shutdown(&mut self) {
-        for (_, client_connection) in self.client_connections.drain() {
-            client_connection.close();
+        if let Some(connection) = self.coordinator_connection.take() {
+            connection.close();
         }
         for peer_connection in self.peer_connections.drain(..) {
             if let Some(connection) = peer_connection {
@@ -313,7 +338,7 @@ impl Network {
 
 enum NewConnection {
     ToPeer(PeerConnection),
-    ToClient(ClientConnection),
+    ToCoordinator(CoordinatorConnection),
 }
 
 struct PeerConnection {
@@ -388,19 +413,17 @@ impl PeerConnection {
     }
 }
 
-struct ClientConnection {
-    client_id: ClientId,
+struct CoordinatorConnection {
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
-    outgoing_messages: UnboundedSender<ServerMessage>,
+    outgoing_messages: UnboundedSender<ServerAnswer>,
 }
 
-impl ClientConnection {
+impl CoordinatorConnection {
     pub fn new(
-        client_id: ClientId,
         connection: TcpStream,
         batch_size: usize,
-        incoming_messages: Sender<(ClientId, ClientMessage)>,
+        incoming_messages: Sender<(ClientId, CoordinatorMessage)>,
     ) -> Self {
         let (reader, mut writer) = frame_servers_connection(connection);
         // Reader Actor
@@ -409,7 +432,7 @@ impl ClientConnection {
             while let Some(messages) = buf_reader.next().await {
                 for msg in messages {
                     match msg {
-                        Ok(m) => incoming_messages.send((client_id, m)).await.unwrap(),
+                        Ok(m) => incoming_messages.send((1, m)).await.unwrap(),
                         Err(err) => error!("Error deserializing message: {:?}", err),
                     }
                 }
@@ -422,20 +445,19 @@ impl ClientConnection {
             while message_rx.recv_many(&mut buffer, batch_size).await != 0 {
                 for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
-                        error!("Couldn't send message to client {client_id}: {err}");
-                        error!("Killing connection to client {client_id}");
+                        error!("Couldn't send message to coordinator: {err}");
+                        error!("Killing connection to coordinator");
                         return;
                     }
                 }
                 if let Err(err) = writer.flush().await {
-                    error!("Couldn't send message to client {client_id}: {err}");
-                    error!("Killing connection to client {client_id}");
+                    error!("Couldn't send message to coordinator: {err}");
+                    error!("Killing connection to coordinator");
                     return;
                 }
             }
         });
-        ClientConnection {
-            client_id,
+        CoordinatorConnection {
             reader_task,
             writer_task,
             outgoing_messages: message_tx,
@@ -444,8 +466,8 @@ impl ClientConnection {
 
     pub fn send(
         &mut self,
-        msg: ServerMessage,
-    ) -> Result<(), mpsc::error::SendError<ServerMessage>> {
+        msg: ServerAnswer,
+    ) -> Result<(), mpsc::error::SendError<ServerAnswer>> {
         self.outgoing_messages.send(msg)
     }
 
@@ -453,4 +475,73 @@ impl ClientConnection {
         self.reader_task.abort();
         self.writer_task.abort();
     }
+}
+
+pub type RegistrationConnection = Framed<
+    CodecFramed<TcpStream, LengthDelimitedCodec>,
+    RegistrationMessage,
+    RegistrationMessage,
+    Bincode<RegistrationMessage, RegistrationMessage>,
+>;
+
+pub fn frame_registration_connection(stream: TcpStream) -> RegistrationConnection {
+    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
+    Framed::new(length_delimited, Bincode::default())
+}
+
+pub type FromNodeConnection = Framed<
+    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+    ClusterMessage,
+    (),
+    Bincode<ClusterMessage, ()>,
+>;
+pub type ToNodeConnection = Framed<
+    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+    (),
+    ClusterMessage,
+    Bincode<(), ClusterMessage>,
+>;
+
+pub fn frame_cluster_connection(stream: TcpStream) -> (FromNodeConnection, ToNodeConnection) {
+    let (reader, writer) = stream.into_split();
+    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+    (
+        FromNodeConnection::new(stream, Bincode::default()),
+        ToNodeConnection::new(sink, Bincode::default()),
+    )
+}
+
+// pub type ServerConnection = Framed<
+//     CodecFramed<TcpStream, LengthDelimitedCodec>,
+//     ServerMessage,
+//     ClientMessage,
+//     Bincode<ServerMessage, ClientMessage>,
+// >;
+
+
+pub type FromClientConnection = Framed<
+    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+    CoordinatorMessage,
+    (),
+    Bincode<CoordinatorMessage, ()>,
+>;
+
+pub type ToClientConnection = Framed<
+    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+    (),
+    ServerAnswer,
+    Bincode<(), ServerAnswer>,
+>;
+
+pub fn frame_servers_connection(
+    stream: TcpStream,
+) -> (FromClientConnection, ToClientConnection) {
+    let (reader, writer) = stream.into_split();
+    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+    (
+        FromClientConnection::new(stream, Bincode::default()),
+        ToClientConnection::new(sink, Bincode::default()),
+    )
 }
