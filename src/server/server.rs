@@ -63,11 +63,11 @@ impl OmniPaxosServer {
         // Save config to output file
         self.save_output().expect("Failed to write to file");
 
-        if let Some(shard) = self.shard1.take() {
-            tokio::spawn(async move {
-                shard.lock().await.run().await;
-            });
-        }
+        // if let Some(shard) = self.shard1.take() {
+        //     tokio::spawn(async move {
+        //         shard.lock().await.run().await;
+        //     });
+        // }
 
         let mut client_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
@@ -173,6 +173,7 @@ impl OmniPaxosServer {
             tokio::select! {
                 _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
                     if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
+                        debug!("{}: Leader is {:?}, is_accept_phase: {:?}", self.id, curr_leader, is_accept_phase);
                         if curr_leader == self.id && is_accept_phase {
                             info!("{}: Leader fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
@@ -181,7 +182,7 @@ impl OmniPaxosServer {
                             break;
                         }
                     }
-                    info!("{}: Attempting to take leadership", self.id);
+                    info!("{}: Attempting to take leadership for coordinator", self.id);
                     self.omnipaxos.try_become_leader();
                     self.send_outgoing_msgs().await;
                 },
@@ -265,7 +266,7 @@ impl OmniPaxosServer {
             .take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
         for msg in self.omnipaxos_msg_buffer.drain(..) {
             let to = msg.get_receiver();
-            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg,0);
+            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             let mut network = self.network.lock().await;
             network.send_to_cluster(to, cluster_msg);
         }
@@ -286,27 +287,14 @@ impl OmniPaxosServer {
         messages: &mut Vec<(NodeId, ClusterMessage)>,
     ) -> bool {
         let mut received_start_signal = false;
-        let mut unprocessed = Vec::new();
         for (from, message) in messages.drain(..) {
-            // Extract the source value regardless of the variant.
-            let source = match message {
-                ClusterMessage::OmniPaxosMessage(_, source) => source,
-                ClusterMessage::LeaderStartSignal(_, source) => source,
-                ClusterMessage::ReadRequest(_, _, _, _, source) => source,
-                ClusterMessage::ReadResponse(_, _, _, source) => source,
-            };
-            // If source is non-zero (not for the coordinator cluster), keep it in the buffer.
-            if source != 0 {
-                unprocessed.push((from, message));
-                continue;
-            }
-            trace!("{}: Received {message:?}", self.id);
+            trace!("{}: Received {message:?} for {}", self.id, 0);
             match message {
-            ClusterMessage::OmniPaxosMessage(m, _) => {
+            ClusterMessage::OmniPaxosMessage(m) => {
                 self.omnipaxos.handle_incoming(m);
                 self.handle_decided_entries().await;
             }
-            ClusterMessage::LeaderStartSignal(start_time, _) => {
+            ClusterMessage::LeaderStartSignal(start_time) => {
                 debug!("Received start message from peer {from}");
                 received_start_signal = true;
                 self.send_client_start_signals(start_time).await;
@@ -319,7 +307,6 @@ impl OmniPaxosServer {
             }
             }
         }
-        messages.extend(unprocessed);
         self.send_outgoing_msgs().await;
         received_start_signal
     }
@@ -340,7 +327,7 @@ impl OmniPaxosServer {
     async fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
         for peer in &self.peers {
             debug!("Sending start message to peer {peer}");
-            let msg = ClusterMessage::LeaderStartSignal(start_time,0);
+            let msg = ClusterMessage::LeaderStartSignal(start_time);
             let mut network = self.network.lock().await;
             network.send_to_cluster(*peer, msg);
         }
@@ -425,7 +412,7 @@ impl OmniPaxosShard {
                 },
                 _ = async  {
                     let mut network = self.network.lock().await;
-                    network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE).await}   => {
+                    network.cluster2_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE).await}   => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
                 },
                 // _ = async {
@@ -470,27 +457,27 @@ impl OmniPaxosShard {
                             info!("{}: Leader fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start).await;
-                            // self.send_client_start_signals(experiment_sync_start).await;
+                            self.send_client_start_signals(experiment_sync_start).await;
                             break;
                         }
                     }
-                    info!("{}: Attempting to take leadership", self.id);
+                    info!("{}: Attempting to take leadership shard", self.id);
                     self.omnipaxos.try_become_leader();
                     self.send_outgoing_msgs().await;
                 },
                 _ = async {
                     let mut network = self.network.lock().await;
-                    network.cluster_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE).await} => {
+                    network.cluster2_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE).await} => {
                         let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
                         if recv_start {
                             break;
                         }
                 },
-                // _ = async {
-                //     let mut network = self.network.lock().await;
-                //     network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE).await} => {
-                //     self.handle_client_messages(client_msg_buffer).await;
-                // },
+                _ = async {
+                    let mut network = self.network.lock().await;
+                    network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE).await} => {
+                    self.handle_client_messages(client_msg_buffer).await;
+                },
             }
         }
     }
@@ -540,27 +527,28 @@ impl OmniPaxosShard {
         self.omnipaxos
             .take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
         for msg in self.omnipaxos_msg_buffer.drain(..) {
+            trace!("{}: Sending {msg:?} to shard", self.id);
             let to = msg.get_receiver();
-            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg,self.shard_id);
+            let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             let mut network = self.network.lock().await;
-            network.send_to_cluster(to, cluster_msg);
+            network.send_to_cluster2(to, cluster_msg);
         }
     }
 
-    // async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
-    //     for (from, message) in messages.drain(..) {
-    //         match message {
-    //             ClientMessage::Handle(command_id, sql_command) => match sql_command.query_type {
-    //                 QueryType::Select => {
-    //                     self.handle_read_message(from, command_id, sql_command)
-    //                         .await;
-    //                 }
-    //                 _ => self.append_to_log(from, command_id, sql_command, None),
-    //             },
-    //         }
-    //     }
-    //     self.send_outgoing_msgs().await;
-    // }
+    async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
+        for (from, message) in messages.drain(..) {
+            match message {
+                ClientMessage::Handle(command_id, sql_command) => match sql_command.query_type {
+                    QueryType::Select => {
+                        self.handle_read_message(from, command_id, sql_command)
+                            .await;
+                    }
+                    _ => self.append_to_log(from, command_id, sql_command, None),
+                },
+            }
+        }
+        self.send_outgoing_msgs().await;
+    }
 
     async fn handle_read_message(
         &mut self,
@@ -597,11 +585,10 @@ impl OmniPaxosShard {
                             self.id,
                             command_id,
                             sql_command,
-                            self.shard_id,
                         );
                         info!("{}: Forwarding read request to leader {}", self.id, leader_id);
                         let mut network = self.network.lock().await;
-                        network.send_to_cluster(leader_id, forward_msg);
+                        network.send_to_cluster2(leader_id, forward_msg);
                     }
                 }
             }
@@ -640,45 +627,31 @@ impl OmniPaxosShard {
         messages: &mut Vec<(NodeId, ClusterMessage)>,
     ) -> bool {
         let mut received_start_signal = false;
-        let mut unprocessed = Vec::new();
         for (from, message) in messages.drain(..) {
-            // Extract the source value regardless of the variant.
-            let source = match message {
-                ClusterMessage::OmniPaxosMessage(_, source) => source,
-                ClusterMessage::LeaderStartSignal(_, source) => source,
-                ClusterMessage::ReadRequest(_, _, _, _, source) => source,
-                ClusterMessage::ReadResponse(_, _, _, source) => source,
-            };
-            // If source is non-zero (not for the coordinator cluster), keep it in the buffer.
-            if source != 0 {
-                unprocessed.push((from, message));
-                continue;
-            }
-            trace!("{}: Received {message:?}", self.id);
+            trace!("{}: Received {message:?} for {}", self.id, self.shard_id);
             match message {
-                ClusterMessage::OmniPaxosMessage(m,_) => {
+                ClusterMessage::OmniPaxosMessage(m) => {
                     self.omnipaxos.handle_incoming(m);
                     self.handle_decided_entries().await;
                 }
-                ClusterMessage::LeaderStartSignal(start_time,_) => {
+                ClusterMessage::LeaderStartSignal(start_time) => {
                     debug!("Received start message from peer {from}");
                     received_start_signal = true;
                     self.send_client_start_signals(start_time).await;
                 }
-                ClusterMessage::ReadRequest(client_id, sender_id, command_id, sql_command, _) => {
+                ClusterMessage::ReadRequest(client_id, sender_id, command_id, sql_command) => {
                     let response = self.database.prepare_command(sql_command, command_id).await;
-                    let msg = ClusterMessage::ReadResponse(client_id, command_id, response, self.shard_id);
+                    let msg = ClusterMessage::ReadResponse(client_id, command_id, response);
                     let mut network = self.network.lock().await;
-                    network.send_to_cluster(sender_id, msg);
+                    network.send_to_cluster2(sender_id, msg);
                 }
-                ClusterMessage::ReadResponse(client_id, command_id, response, _) => {
+                ClusterMessage::ReadResponse(client_id, command_id, response) => {
                     let msg = ServerMessage::Answer(command_id, response);
                     let mut network = self.network.lock().await;
                     network.send_to_client(client_id, msg);
                 }
             }
         }
-        messages.extend(unprocessed);
         self.send_outgoing_msgs().await;
         received_start_signal
     }
@@ -699,9 +672,9 @@ impl OmniPaxosShard {
     async fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
         for peer in &self.peers {
             debug!("Sending start message to peer {peer}");
-            let msg = ClusterMessage::LeaderStartSignal(start_time, self.shard_id);
+            let msg = ClusterMessage::LeaderStartSignal(start_time);
             let mut network = self.network.lock().await;
-            network.send_to_cluster(*peer, msg);
+            network.send_to_cluster2(*peer, msg);
         }
     }
 

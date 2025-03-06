@@ -1,5 +1,5 @@
 x-common-variables: &common-server-variables
-  RUST_LOG: "debug"
+  RUST_LOG: "trace"
   SERVER_CONFIG_FILE: "/app/server-config.toml"
   CLUSTER_CONFIG_FILE: "/app/cluster-config.toml"
   OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000" # Overwrite node_addrs in cluster config TOML

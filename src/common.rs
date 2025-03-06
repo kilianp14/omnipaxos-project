@@ -10,15 +10,16 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
+        NodeRegister2(NodeId),
         ClientRegister,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClusterMessage {
-        OmniPaxosMessage(OmniPaxosMessage<Command>, u32),
-        LeaderStartSignal(Timestamp, u32),
-        ReadRequest(NodeId, NodeId, CommandId, SqlCommand, u32),
-        ReadResponse(NodeId, CommandId, Option<String>, u32),
+        OmniPaxosMessage(OmniPaxosMessage<Command>),
+        LeaderStartSignal(Timestamp),
+        ReadRequest(NodeId, NodeId, CommandId, SqlCommand),
+        ReadResponse(NodeId, CommandId, Option<String>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
