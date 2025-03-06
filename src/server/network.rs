@@ -10,7 +10,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::{select, sync::mpsc::{Sender, UnboundedSender}};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::Receiver,
@@ -23,8 +23,12 @@ use crate::configs::OmniPaxosSqlConfig;
 pub trait NetworkTrait {
     fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage);
     fn send_to_client(&mut self, client_id: ClientId, msg: ServerMessage);
-    async fn cluster_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClusterMessage)>, batch_size: usize) -> usize;
-    async fn client_recv_many(&mut self, buffer: &mut Vec<(ClientId, ClientMessage)>, batch_size: usize) -> usize;
+    async fn recv_many(
+        &mut self,
+        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
+        client_msg_buf: &mut Vec<(ClientId, ClientMessage)>,
+        batch_size: usize,
+    );
 }
 
 pub struct Network {
@@ -89,12 +93,25 @@ impl NetworkTrait for Network {
         }
     }
 
-    async fn cluster_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClusterMessage)>, batch_size: usize) -> usize {
-        self.cluster_messages.recv_many(buffer, batch_size).await
-    }
-    
-    async fn client_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClientMessage)>, batch_size: usize) -> usize {
-        self.client_messages.recv_many(buffer, batch_size).await
+    async fn recv_many(
+        &mut self,
+        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
+        client_msg_buf: &mut Vec<(ClientId, ClientMessage)>,
+        batch_size: usize,
+    ) {
+        let mut timeout_interval = tokio::time::interval(Duration::from_millis(5));
+
+        while cluster_msg_buf.len() < batch_size || client_msg_buf.len() < batch_size {
+            select! {
+                Some(msg) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
+                    cluster_msg_buf.push(msg);
+                }
+                Some(msg) = self.client_messages.recv(), if client_msg_buf.len() < batch_size => {
+                    client_msg_buf.push(msg);
+                }
+                _ = timeout_interval.tick() => break,
+            }
+        }
     }
 }
 

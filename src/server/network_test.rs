@@ -14,6 +14,7 @@ use std::time::Duration;
 use std::str::FromStr;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::{
+    select,
     net::{TcpListener, TcpStream},
     sync::mpsc::Receiver,
 };
@@ -43,7 +44,6 @@ pub struct TestNetwork {
     cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
     cluster_messages: Receiver<(NodeId, ClusterMessage)>,
     coordinator_messages: Receiver<(ClientId, CoordinatorMessage)>,
-    pending_cluster_messages: Vec<(NodeId, ClusterMessage)>,
 }
 
 fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
@@ -70,19 +70,18 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
 impl NetworkTrait for TestNetwork {
 
     fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
-        if let ClusterMessage::OmniPaxosMessage(ref op_msg) = msg {
-            if let Message::SequencePaxos(PaxosMessage { from: _, to: node_id, msg: px_msg }) = op_msg {
-                if let PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) = px_msg {
-                    match &mut self.coordinator_connection {
-                        Some(ref mut connection) => {
-                            if let Err(err) = connection.send(ServerAnswer::Decide(*node_id, msg)) {
-                                warn!("Couldn't send msg to coordinator: {err}");
-                                self.coordinator_connection = None;
-                            }
-                        }
-                        None => warn!("Not connected to coordinator"),
+        if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
+            PaxosMessage { from: _, to: node_id, msg: PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) }
+        )) = msg {
+            println!("Received decide");
+            match &mut self.coordinator_connection {
+                Some(ref mut connection) => {
+                    if let Err(err) = connection.send(ServerAnswer::Decide(node_id, msg)) {
+                        warn!("Couldn't send msg to coordinator: {err}");
+                        self.coordinator_connection = None;
                     }
                 }
+                None => warn!("Not connected to coordinator"),
             }
         }
         else {
@@ -112,26 +111,32 @@ impl NetworkTrait for TestNetwork {
         }
     }
 
-    async fn cluster_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClusterMessage)>, batch_size: usize) -> usize {
-        self.cluster_messages.recv_many(buffer, batch_size).await;
-        buffer.append(&mut self.pending_cluster_messages);
-        buffer.len()
-    }
-    
-    async fn client_recv_many(&mut self, buffer: &mut Vec<(NodeId, ClientMessage)>, batch_size: usize) -> usize {
-        let mut temp_buffer: Vec<(NodeId, CoordinatorMessage)> = Vec::with_capacity(batch_size);
-        self.coordinator_messages.recv_many(&mut temp_buffer, batch_size).await;
-        for message in temp_buffer {
-            match message {
-                (id, CoordinatorMessage::ClientMessage(client_msg)) => {
-                    buffer.push((id, client_msg));
-                },
-                (id, CoordinatorMessage::ClusterMessage(cluster_msg)) => {
-                    self.pending_cluster_messages.push((id, cluster_msg));
+    async fn recv_many(
+        &mut self,
+        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
+        client_msg_buf: &mut Vec<(ClientId, ClientMessage)>,
+        batch_size: usize,
+    ) {
+        let mut timeout_interval = tokio::time::interval(Duration::from_millis(5));
+
+        while cluster_msg_buf.len() < batch_size || client_msg_buf.len() < batch_size {
+            select! {
+                Some(msg) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
+                    cluster_msg_buf.push(msg);
                 }
+                Some(msg) = self.coordinator_messages.recv(), if (client_msg_buf.len() < batch_size && cluster_msg_buf.len() < batch_size) => {
+                    match msg {
+                        (id, CoordinatorMessage::ClusterMessage(cls_msg)) => {
+                            cluster_msg_buf.push((id, cls_msg));
+                        },
+                        (id, CoordinatorMessage::ClientMessage(cli_msg)) => {
+                            client_msg_buf.push((id, cli_msg));
+                        },
+                    };
+                }
+                _ = timeout_interval.tick() => break,
             }
         }
-        buffer.len()
     }
 }
 
@@ -151,7 +156,6 @@ impl TestNetwork {
         cluster_connections.resize_with(peer_addresses.len(), Default::default);
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(batch_size);
         let (coordinator_message_sender, coordinator_messages) = tokio::sync::mpsc::channel(batch_size);
-        let pending_cluster_messages: Vec<(NodeId, ClusterMessage)> = Vec::with_capacity(100);
         let mut network = Self {
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
@@ -161,7 +165,6 @@ impl TestNetwork {
             cluster_message_sender,
             cluster_messages,
             coordinator_messages,
-            pending_cluster_messages,
         };
         network
             .initialize_connections(id, peer_addresses, listen_address)

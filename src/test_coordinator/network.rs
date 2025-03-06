@@ -1,17 +1,33 @@
 use futures::{SinkExt, StreamExt};
 use log::*;
-use omnipaxos_sql::common::{messages::*, sql::NodeId, utils::*};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio_serde::{formats::Bincode, Framed};
+use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
+use omnipaxos_sql::common::{messages::*, sql::NodeId};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, channel};
 use tokio::task::JoinHandle;
 use tokio::{net::TcpStream, sync::mpsc::Receiver};
 use tokio::{sync::mpsc::Sender, time::interval};
+use serde::{Serialize, Deserialize};
 
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ServerAnswer {
+    ServerMessage(ServerMessage),
+    Decide(NodeId, ClusterMessage),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum CoordinatorMessage {
+    ClientMessage(ClientMessage),
+    ClusterMessage(ClusterMessage),
+}
 pub struct Network {
     server_connections: Vec<Option<ServerConnection>>,
-    server_message_sender: Sender<ServerMessage>,
-    pub server_messages: Receiver<ServerMessage>,
+    server_message_sender: Sender<ServerAnswer>,
+    pub server_messages: Receiver<ServerAnswer>,
     batch_size: usize,
 }
 
@@ -92,7 +108,7 @@ impl Network {
         }
     }
 
-    pub async fn send(&mut self, to: NodeId, msg: ClientMessage) {
+    pub async fn send(&mut self, to: NodeId, msg: CoordinatorMessage) {
         match self.server_connections.get_mut(to as usize) {
             Some(connection_slot) => match connection_slot {
                 Some(connection) => {
@@ -125,7 +141,7 @@ struct ServerConnection {
     // server_id: NodeId,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
-    outgoing_messages: Sender<ClientMessage>,
+    outgoing_messages: Sender<CoordinatorMessage>,
 }
 
 impl ServerConnection {
@@ -134,7 +150,7 @@ impl ServerConnection {
         reader: FromServerConnection,
         mut writer: ToServerConnection,
         batch_size: usize,
-        incoming_messages: Sender<ServerMessage>,
+        incoming_messages: Sender<ServerAnswer>,
     ) -> Self {
         // Reader Actor
         let reader_task = tokio::spawn(async move {
@@ -176,8 +192,8 @@ impl ServerConnection {
 
     pub async fn send(
         &mut self,
-        msg: ClientMessage,
-    ) -> Result<(), mpsc::error::SendError<ClientMessage>> {
+        msg: CoordinatorMessage,
+    ) -> Result<(), mpsc::error::SendError<CoordinatorMessage>> {
         self.outgoing_messages.send(msg).await
     }
 
@@ -185,4 +201,45 @@ impl ServerConnection {
         self.reader_task.abort();
         self.writer_task.abort();
     }
+}
+
+
+pub type Timestamp = i64;
+
+pub type RegistrationConnection = Framed<
+    CodecFramed<TcpStream, LengthDelimitedCodec>,
+    RegistrationMessage,
+    RegistrationMessage,
+    Bincode<RegistrationMessage, RegistrationMessage>,
+>;
+
+pub fn frame_registration_connection(stream: TcpStream) -> RegistrationConnection {
+    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
+    Framed::new(length_delimited, Bincode::default())
+}
+
+pub type FromServerConnection = Framed<
+    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+    ServerAnswer,
+    (),
+    Bincode<ServerAnswer, ()>,
+>;
+
+pub type ToServerConnection = Framed<
+    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+    (),
+    CoordinatorMessage,
+    Bincode<(), CoordinatorMessage>,
+>;
+
+pub fn frame_clients_connection(
+    stream: TcpStream,
+) -> (FromServerConnection, ToServerConnection) {
+    let (reader, writer) = stream.into_split();
+    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+    (
+        FromServerConnection::new(stream, Bincode::default()),
+        ToServerConnection::new(sink, Bincode::default()),
+    )
 }
