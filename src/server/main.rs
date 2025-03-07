@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosSqlConfig, database::Database, server::OmniPaxosServer, server::OmniPaxosShard, network::Network};
+use crate::{configs::OmniPaxosSqlConfig, database::Database, server::OmniPaxosServer, network::Network};
 use env_logger;
 use log::info;
 use std::sync::Arc;
@@ -22,16 +22,13 @@ pub async fn main() {
         Err(e) => panic!("{e}"),
     };
 
-    let network = Arc::new(Mutex::new(Box::new(Network::new(server_config.clone(), NETWORK_BATCH_SIZE).await)));
+    let network = Network::new(server_config.clone(), NETWORK_BATCH_SIZE).await;
 
-    let shard1 = Arc::new(Mutex::new(OmniPaxosShard::new(server_config.clone(), network.clone()).await));
-    let server = Arc::new(Mutex::new(OmniPaxosServer::new(server_config.clone(), network.clone(), Arc::clone(&shard1)).await));
-    shard1.lock().await.server = Some(Arc::clone(&server));
+    let base_url = "postgres://postgres@localhost:5432"; // Base DB URL
+    let database = Arc::new(Database::new(base_url).await);
 
-    // let (server_result, shard1_result) = join!(
-    //     async { server.lock().await.run().await },
-    //     async { shard1.lock().await.run().await }
-    // );
-    server.lock().await.run().await;
-    // shard1.lock().await.run().await;
+
+    let mut server = OmniPaxosServer::new(server_config.clone(), network, database).await;
+
+    server.run().await;
 }
