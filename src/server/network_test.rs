@@ -6,6 +6,7 @@ use omnipaxos_sql::common::{
     messages::*,
     sql::{ClientId, NodeId},
 };
+use std::collections::HashMap;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_serde::{formats::Bincode, Framed};
 use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -33,6 +34,8 @@ pub enum ServerAnswer {
 pub enum CoordinatorMessage {
     ClientMessage(ClientMessage),
     ClusterMessage(ClusterMessage),
+    Disconnect(NodeId),
+    Reconnect(NodeId),
 }
 
 pub struct TestNetwork {
@@ -44,6 +47,7 @@ pub struct TestNetwork {
     cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
     cluster_messages: Receiver<(NodeId, ClusterMessage)>,
     coordinator_messages: Receiver<(ClientId, CoordinatorMessage)>,
+    disconnected: HashMap<NodeId, (Vec<ClusterMessage>, Vec<ClusterMessage>)>,
 }
 
 fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
@@ -70,10 +74,12 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
 impl NetworkTrait for TestNetwork {
 
     fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
-        if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
+        if let Some((sending, _)) = self.disconnected.get_mut(&to) {
+            sending.push(msg);
+        }
+        else if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
             PaxosMessage { from: _, to: node_id, msg: PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) }
         )) = msg {
-            println!("Received decide");
             match &mut self.coordinator_connection {
                 Some(ref mut connection) => {
                     if let Err(err) = connection.send(ServerAnswer::Decide(node_id, msg)) {
@@ -121,16 +127,39 @@ impl NetworkTrait for TestNetwork {
 
         while cluster_msg_buf.len() < batch_size || client_msg_buf.len() < batch_size {
             select! {
-                Some(msg) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
-                    cluster_msg_buf.push(msg);
+                Some((id, msg)) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
+                    if let Some((_, receiving)) = self.disconnected.get_mut(&id){
+                        receiving.push(msg);
+                    }
+                    else {
+                        cluster_msg_buf.push((id, msg));
+                    }
                 }
                 Some(msg) = self.coordinator_messages.recv(), if (client_msg_buf.len() < batch_size && cluster_msg_buf.len() < batch_size) => {
                     match msg {
                         (id, CoordinatorMessage::ClusterMessage(cls_msg)) => {
-                            cluster_msg_buf.push((id, cls_msg));
+                            if let Some((_, receiving)) = self.disconnected.get_mut(&id){
+                                receiving.push(cls_msg);
+                            }
+                            else {
+                                cluster_msg_buf.push((id, cls_msg));
+                            }
                         },
                         (id, CoordinatorMessage::ClientMessage(cli_msg)) => {
                             client_msg_buf.push((id, cli_msg));
+                        },
+                        (_, CoordinatorMessage::Disconnect(node_id)) => {
+                            self.disconnected.insert(node_id, (Vec::with_capacity(100), Vec::with_capacity(100)));
+                        },
+                        (_, CoordinatorMessage::Reconnect(node_id)) => {
+                            if let Some((sending, received)) = self.disconnected.remove(&node_id) {
+                                for message in received {
+                                    cluster_msg_buf.push((node_id, message));
+                                }
+                                for message in sending {
+                                    self.send_to_cluster(node_id, message);
+                                }
+                            }
                         },
                     };
                 }
@@ -156,6 +185,7 @@ impl TestNetwork {
         cluster_connections.resize_with(peer_addresses.len(), Default::default);
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(batch_size);
         let (coordinator_message_sender, coordinator_messages) = tokio::sync::mpsc::channel(batch_size);
+        let disconnected = HashMap::new();
         let mut network = Self {
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
@@ -165,6 +195,7 @@ impl TestNetwork {
             cluster_message_sender,
             cluster_messages,
             coordinator_messages,
+            disconnected,
         };
         network
             .initialize_connections(id, peer_addresses, listen_address)

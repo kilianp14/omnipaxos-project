@@ -87,7 +87,7 @@ pub mod sql {
                 consistency: None,
             }
         }
-        pub fn insert_cmd(client_id: String, key: String) -> Self {
+        pub fn insert_cmd(key: String, value: String) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
@@ -95,7 +95,7 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
-                values: Some(vec![key.clone(), format!("{}_value_{}", client_id, key)]),
+                values: Some(vec![key.clone(), value.clone()]),
                 conditions: None,
                 consistency: None,
             }

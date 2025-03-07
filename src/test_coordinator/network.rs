@@ -23,6 +23,8 @@ pub enum ServerAnswer {
 pub enum CoordinatorMessage {
     ClientMessage(ClientMessage),
     ClusterMessage(ClusterMessage),
+    Disconnect(NodeId),
+    Reconnect(NodeId),
 }
 pub struct Network {
     server_connections: Vec<Option<ServerConnection>>,
@@ -202,9 +204,6 @@ impl ServerConnection {
         self.writer_task.abort();
     }
 }
-
-
-pub type Timestamp = i64;
 
 pub type RegistrationConnection = Framed<
     CodecFramed<TcpStream, LengthDelimitedCodec>,
