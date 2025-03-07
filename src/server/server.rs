@@ -44,8 +44,8 @@ impl OmniPaxosServer {
         // Waits for client and server network connections to be established
         // let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
 
+
         
-         
         OmniPaxosServer {
             id: config.local.server_id,
             network,

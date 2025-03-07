@@ -1,9 +1,10 @@
 use crate::{configs::OmniPaxosSqlConfig, database::Database, server::OmniPaxosServer, server::OmniPaxosShard, network::Network};
 use env_logger;
+use log::info;
 use std::sync::Arc;
 use std::rc::Rc;
 use std::cell::RefCell;
-use tokio::{net, sync::Mutex};
+use tokio::{net, sync::Mutex, join};
 
 mod configs;
 mod database;
@@ -20,12 +21,17 @@ pub async fn main() {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };
-    
+
     let network = Arc::new(Mutex::new(Box::new(Network::new(server_config.clone(), NETWORK_BATCH_SIZE).await)));
 
     let shard1 = Arc::new(Mutex::new(OmniPaxosShard::new(server_config.clone(), network.clone()).await));
     let server = Arc::new(Mutex::new(OmniPaxosServer::new(server_config.clone(), network.clone(), Arc::clone(&shard1)).await));
     shard1.lock().await.server = Some(Arc::clone(&server));
 
+    // let (server_result, shard1_result) = join!(
+    //     async { server.lock().await.run().await },
+    //     async { shard1.lock().await.run().await }
+    // );
     server.lock().await.run().await;
+    // shard1.lock().await.run().await;
 }
