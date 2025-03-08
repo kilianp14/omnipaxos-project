@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosSqlConfig, database::Database, network::Network};
+use crate::{configs::OmniPaxosSqlConfig, database::Database, network::NetworkTrait};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -14,12 +14,12 @@ use std::{fs::File, io::Write, time::Duration};
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
-const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
+const ELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct OmniPaxosServer {
     id: NodeId,
     database: Arc<Database>,
-    network: Network,
+    network: Box<dyn NetworkTrait>,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
@@ -28,14 +28,13 @@ pub struct OmniPaxosServer {
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>) -> Self {
+    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>, network: Box<dyn NetworkTrait>) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
         // Waits for client and server network connections to be established
-        let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         OmniPaxosServer {
             id: config.local.server_id,
             database,
@@ -56,19 +55,26 @@ impl OmniPaxosServer {
         // We don't use Omnipaxos leader election at first and instead force a specific initial leader
         self.establish_initial_leader(&mut cluster_msg_buf, &mut client_msg_buf)
             .await;
+        info!{"{}: Initial election phase over", self.id};
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
+                    match self.omnipaxos.get_current_leader() {
+                        Some(leader) => info!("{}: Current Leader: {}, QC: {}", self.id, leader.0, leader.1),
+                        None => {}
+                    }
                     self.send_outgoing_msgs();
                 },
-                _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
-                    self.handle_cluster_messages(&mut cluster_msg_buf).await;
-                },
-                _ = self.network.client_messages.recv_many(&mut client_msg_buf, NETWORK_BATCH_SIZE) => {
-                    self.handle_client_messages(&mut client_msg_buf).await;
+                _ = self.network.recv_many(&mut cluster_msg_buf, &mut client_msg_buf, NETWORK_BATCH_SIZE) => {
+                    if !cluster_msg_buf.is_empty() {
+                        self.handle_cluster_messages(&mut cluster_msg_buf).await;
+                    }
+                    if !client_msg_buf.is_empty() {
+                        self.handle_client_messages(&mut client_msg_buf).await;
+                    }
                 },
             }
         }
@@ -91,7 +97,7 @@ impl OmniPaxosServer {
                             info!("{}: Leader fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start);
-                            self.send_client_start_signals(experiment_sync_start);
+                            self.send_client_start_signals(experiment_sync_start).await;
                             break;
                         }
                     }
@@ -99,14 +105,16 @@ impl OmniPaxosServer {
                     self.omnipaxos.try_become_leader();
                     self.send_outgoing_msgs();
                 },
-                _ = self.network.cluster_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE) => {
-                    let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
-                    if recv_start {
-                        break;
+                _ = self.network.recv_many(cluster_msg_buffer, client_msg_buffer, NETWORK_BATCH_SIZE) => {
+                    if !cluster_msg_buffer.is_empty() {
+                        let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
+                        if recv_start {
+                            break;
+                        }
                     }
-                },
-                _ = self.network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE) => {
-                    self.handle_client_messages(client_msg_buffer).await;
+                    if !client_msg_buffer.is_empty() {
+                        self.handle_client_messages(client_msg_buffer).await;
+                    }
                 },
             }
         }
@@ -250,7 +258,7 @@ impl OmniPaxosServer {
                 ClusterMessage::LeaderStartSignal(start_time) => {
                     debug!("Received start message from peer {from}");
                     received_start_signal = true;
-                    self.send_client_start_signals(start_time);
+                    self.send_client_start_signals(start_time).await;
                 }
                 ClusterMessage::ReadRequest(client_id, sender_id, command_id, sql_command) => {
                     let response = self.database.handle_command(sql_command).await;
@@ -287,7 +295,7 @@ impl OmniPaxosServer {
         }
     }
 
-    fn send_client_start_signals(&mut self, start_time: Timestamp) {
+    async fn send_client_start_signals(&mut self, start_time: Timestamp) {
         for client_id in 1..self.config.local.num_clients as ClientId + 1 {
             debug!("Sending start message to client {client_id}");
             let msg = ServerMessage::StartSignal(start_time);

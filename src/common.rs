@@ -87,7 +87,7 @@ pub mod sql {
                 consistency: None,
             }
         }
-        pub fn insert_cmd(client_id: String, key: String) -> Self {
+        pub fn insert_cmd(key: String, value: String) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
@@ -95,7 +95,7 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
-                values: Some(vec![key.clone(), format!("{}_value_{}", client_id, key)]),
+                values: Some(vec![key.clone(), value.clone()]),
                 conditions: None,
                 consistency: None,
             }
@@ -128,53 +128,6 @@ pub mod sql {
         Local,
         Linearizable,
     }
-
-    //#[derive(Clone, Debug, Serialize, Deserialize)]
-    //pub struct KVSnapshot {
-    //snapshotted: HashMap<String, String>,
-    //deleted_keys: Vec<String>,
-    //}
-
-    //impl Snapshot<Command> for KVSnapshot {
-    //fn create(entries: &[Command]) -> Self {
-    //let mut snapshotted = HashMap::new();
-    //let mut deleted_keys: Vec<String> = Vec::new();
-    //for e in entries {
-    //match &e.kv_cmd {
-    //KVCommand::Put(key, value) => {
-    //snapshotted.insert(key.clone(), value.clone());
-    //}
-    //KVCommand::Delete(key) => {
-    //if snapshotted.remove(key).is_none() {
-    //// key was not in the snapshot
-    //deleted_keys.push(key.clone());
-    //}
-    //}
-    //KVCommand::Get(_) => (),
-    //}
-    //}
-    //// remove keys that were put back
-    //deleted_keys.retain(|k| !snapshotted.contains_key(k));
-    //Self {
-    //snapshotted,
-    //deleted_keys,
-    //}
-    //}
-
-    //fn merge(&mut self, delta: Self) {
-    //for (k, v) in delta.snapshotted {
-    //self.snapshotted.insert(k, v);
-    //}
-    //for k in delta.deleted_keys {
-    //self.snapshotted.remove(&k);
-    //}
-    //self.deleted_keys.clear();
-    //}
-
-    //fn use_snapshots() -> bool {
-    //true
-    //}
-    //}
 }
 
 pub mod utils {
