@@ -11,6 +11,7 @@ pub mod messages {
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
         NodeRegister2(NodeId),
+        NodeRegister3(NodeId),
         ClientRegister,
     }
 

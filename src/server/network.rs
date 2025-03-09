@@ -7,8 +7,8 @@ use omnipaxos_sql::common::{
 };
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
+use std::time::Duration;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -23,6 +23,8 @@ pub struct Network {
     peer_connections: Vec<Option<PeerConnection>>,
     /// Second cluster channel connections.
     peer_connections2: Vec<Option<Peer2Connection>>,
+    /// Third cluster channel connections.
+    peer_connections3: Vec<Option<Peer3Connection>>,
     client_connections: HashMap<ClientId, ClientConnection>,
     max_client_id: Arc<Mutex<ClientId>>,
     batch_size: usize,
@@ -31,6 +33,8 @@ pub struct Network {
     pub cluster_messages: Receiver<(NodeId, ClusterMessage)>,
     cluster2_message_sender: Sender<(NodeId, ClusterMessage)>,
     pub cluster2_messages: Receiver<(NodeId, ClusterMessage)>,
+    cluster3_message_sender: Sender<(NodeId, ClusterMessage)>,
+    pub cluster3_messages: Receiver<(NodeId, ClusterMessage)>,
     pub client_messages: Receiver<(ClientId, ClientMessage)>,
 }
 
@@ -55,7 +59,7 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
 }
 
 impl Network {
-    // Creates a new network with connections other server nodes in the cluster and any clients.
+    // Creates a new network with connections to other server nodes in the cluster and any clients.
     // Waits until connections to all servers and clients are established before resolving.
     pub async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self {
         let (listen_address, node_addresses) = get_addrs(config.clone());
@@ -73,15 +77,20 @@ impl Network {
         cluster_connections.resize_with(num_peers, Default::default);
         let mut cluster2_connections = vec![];
         cluster2_connections.resize_with(num_peers, Default::default);
+        let mut cluster3_connections = vec![];
+        cluster3_connections.resize_with(num_peers, Default::default);
 
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(batch_size);
         let (cluster2_message_sender, cluster2_messages) =
+            tokio::sync::mpsc::channel(batch_size);
+        let (cluster3_message_sender, cluster3_messages) =
             tokio::sync::mpsc::channel(batch_size);
         let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(batch_size);
         let mut network = Self {
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
             peer_connections2: cluster2_connections,
+            peer_connections3: cluster3_connections,
             client_connections: HashMap::new(),
             max_client_id: Arc::new(Mutex::new(0)),
             batch_size,
@@ -90,6 +99,8 @@ impl Network {
             cluster_messages,
             cluster2_message_sender,
             cluster2_messages,
+            cluster3_message_sender,
+            cluster3_messages,
             client_messages,
         };
         let num_clients = config.local.num_clients;
@@ -110,7 +121,8 @@ impl Network {
         let listener_handle =
             self.spawn_connection_listener(connection_sink.clone(), listen_address);
         self.spawn_peer_connectors(connection_sink.clone(), id, peers.clone());
-        self.spawn_peer_connectors2(connection_sink.clone(), id, peers);
+        self.spawn_peer_connectors2(connection_sink.clone(), id, peers.clone());
+        self.spawn_peer_connectors3(connection_sink.clone(), id, peers.clone());
         while let Some(new_connection) = connection_source.recv().await {
             match new_connection {
                 NewConnection::ToPeer(connection) => {
@@ -120,6 +132,10 @@ impl Network {
                 NewConnection::ToPeer2(connection) => {
                     let peer_idx = self.cluster_id_to_idx(connection.peer_id).unwrap();
                     self.peer_connections2[peer_idx] = Some(connection);
+                }
+                NewConnection::ToPeer3(connection) => {
+                    let peer_idx = self.cluster_id_to_idx(connection.peer_id).unwrap();
+                    self.peer_connections3[peer_idx] = Some(connection);
                 }
                 NewConnection::ToClient(connection) => {
                     let _ = self
@@ -132,7 +148,9 @@ impl Network {
                 self.peer_connections.iter().all(|c| c.is_some());
             let all_cluster2_connected =
                 self.peer_connections2.iter().all(|c| c.is_some());
-            if all_clients_connected && all_cluster_connected && all_cluster2_connected {
+            let all_cluster3_connected =
+                self.peer_connections3.iter().all(|c| c.is_some());
+            if all_clients_connected && all_cluster_connected && all_cluster2_connected && all_cluster3_connected {
                 listener_handle.abort();
                 break;
             }
@@ -147,6 +165,7 @@ impl Network {
         let client_sender = self.client_message_sender.clone();
         let cluster_sender = self.cluster_message_sender.clone();
         let cluster2_sender = self.cluster2_message_sender.clone();
+        let cluster3_sender = self.cluster3_message_sender.clone();
         let max_client_id_handle = self.max_client_id.clone();
         let batch_size = self.batch_size;
         tokio::spawn(async move {
@@ -161,6 +180,7 @@ impl Network {
                             client_sender.clone(),
                             cluster_sender.clone(),
                             cluster2_sender.clone(),
+                            cluster3_sender.clone(),
                             connection_sender.clone(),
                             max_client_id_handle.clone(),
                             batch_size,
@@ -177,6 +197,7 @@ impl Network {
         client_message_sender: Sender<(ClientId, ClientMessage)>,
         cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
         cluster2_message_sender: Sender<(NodeId, ClusterMessage)>,
+        cluster3_message_sender: Sender<(NodeId, ClusterMessage)>,
         connection_sender: Sender<NewConnection>,
         max_client_id_handle: Arc<Mutex<ClientId>>,
         batch_size: usize,
@@ -202,6 +223,16 @@ impl Network {
                     underlying_stream,
                     batch_size,
                     cluster2_message_sender,
+                ))
+            }
+            Some(Ok(RegistrationMessage::NodeRegister3(node_id))) => {
+                info!("Identified cluster3 connection from node {node_id}");
+                let underlying_stream = registration_connection.into_inner().into_inner();
+                NewConnection::ToPeer3(Peer3Connection::new(
+                    node_id,
+                    underlying_stream,
+                    batch_size,
+                    cluster3_message_sender,
                 ))
             }
             Some(Ok(RegistrationMessage::ClientRegister)) => {
@@ -304,7 +335,7 @@ impl Network {
                     }
                 };
                 let mut registration_connection = frame_registration_connection(peer_connection);
-                // send the new handshake for cluster2.
+                // Send handshake for cluster2.
                 let handshake = RegistrationMessage::NodeRegister2(my_id);
                 if let Err(err) = registration_connection.send(handshake).await {
                     error!("Error sending cluster2 handshake to {peer}: {err}");
@@ -314,6 +345,49 @@ impl Network {
                 let peer_actor =
                     Peer2Connection::new(peer, underlying_stream, batch_size, cluster2_sender);
                 let new_connection = NewConnection::ToPeer2(peer_actor);
+                connection_sender.send(new_connection).await.unwrap();
+            });
+        }
+    }
+
+    fn spawn_peer_connectors3(
+        &self,
+        connection_sender: Sender<NewConnection>,
+        my_id: NodeId,
+        peers: Vec<(NodeId, SocketAddr)>,
+    ) {
+        let peers_to_connect_to = peers.into_iter().filter(|(peer_id, _)| *peer_id < my_id);
+        for (peer, peer_address) in peers_to_connect_to {
+            let reconnect_delay = Duration::from_secs(1);
+            let mut reconnect_interval = tokio::time::interval(reconnect_delay);
+            let cluster3_sender = self.cluster3_message_sender.clone();
+            let connection_sender = connection_sender.clone();
+            let batch_size = self.batch_size;
+            tokio::spawn(async move {
+                let peer_connection = loop {
+                    reconnect_interval.tick().await;
+                    match TcpStream::connect(peer_address).await {
+                        Ok(connection) => {
+                            info!("New connection to node {peer} for cluster3 channel");
+                            connection.set_nodelay(true).unwrap();
+                            break connection;
+                        }
+                        Err(err) => {
+                            error!("Establishing connection to node {peer} failed: {err}")
+                        }
+                    }
+                };
+                let mut registration_connection = frame_registration_connection(peer_connection);
+                // Send handshake for cluster3.
+                let handshake = RegistrationMessage::NodeRegister3(my_id);
+                if let Err(err) = registration_connection.send(handshake).await {
+                    error!("Error sending cluster3 handshake to {peer}: {err}");
+                    return;
+                }
+                let underlying_stream = registration_connection.into_inner().into_inner();
+                let peer_actor =
+                    Peer3Connection::new(peer, underlying_stream, batch_size, cluster3_sender);
+                let new_connection = NewConnection::ToPeer3(peer_actor);
                 connection_sender.send(new_connection).await.unwrap();
             });
         }
@@ -351,6 +425,22 @@ impl Network {
         }
     }
 
+    pub fn send_to_cluster3(&mut self, to: NodeId, msg: ClusterMessage) {
+        if let Some(idx) = self.cluster_id_to_idx(to) {
+            match &mut self.peer_connections3[idx] {
+                Some(connection) => {
+                    if let Err(err) = connection.send(msg) {
+                        warn!("Couldn't send msg to peer {to} on cluster3: {err}");
+                        self.peer_connections3[idx] = None;
+                    }
+                }
+                None => warn!("Not connected to node {to} on cluster3"),
+            }
+        } else {
+            error!("Sending to unexpected node {to}");
+        }
+    }
+
     pub fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
         match self.client_connections.get_mut(&to) {
             Some(connection) => {
@@ -378,9 +468,15 @@ impl Network {
                 connection.close();
             }
         }
+        for peer_connection in self.peer_connections3.drain(..) {
+            if let Some(connection) = peer_connection {
+                connection.close();
+            }
+        }
         for _ in 0..self.peers.len() {
             self.peer_connections.push(None);
             self.peer_connections2.push(None);
+            self.peer_connections3.push(None);
         }
     }
 
@@ -393,6 +489,7 @@ impl Network {
 enum NewConnection {
     ToPeer(PeerConnection),
     ToPeer2(Peer2Connection),
+    ToPeer3(Peer3Connection),
     ToClient(ClientConnection),
 }
 
@@ -419,8 +516,8 @@ impl PeerConnection {
                     match msg {
                         Ok(m) => {
                             if let Err(_) = incoming_messages.send((peer_id, m)).await {
-                            break;
-                            };
+                                break;
+                            }
                         }
                         Err(err) => {
                             error!("Error deserializing message: {:?}", err);
@@ -441,7 +538,7 @@ impl PeerConnection {
                     }
                 }
                 if let Err(err) = writer.flush().await {
-                    error!("Couldn't send message to node {peer_id}: {err}");
+                    error!("Couldn't flush messages to node {peer_id}: {err}");
                     break;
                 }
             }
@@ -468,7 +565,7 @@ impl PeerConnection {
     }
 }
 
-// NEW: The peer connection for cluster2 is nearly identical.
+// Peer2Connection is similar to PeerConnection.
 struct Peer2Connection {
     peer_id: NodeId,
     reader_task: JoinHandle<()>,
@@ -536,6 +633,74 @@ impl Peer2Connection {
     }
 }
 
+// NEW: Peer3Connection for the third channel.
+struct Peer3Connection {
+    peer_id: NodeId,
+    reader_task: JoinHandle<()>,
+    writer_task: JoinHandle<()>,
+    outgoing_messages: UnboundedSender<ClusterMessage>,
+}
+
+impl Peer3Connection {
+    pub fn new(
+        peer_id: NodeId,
+        connection: TcpStream,
+        batch_size: usize,
+        incoming_messages: Sender<(NodeId, ClusterMessage)>,
+    ) -> Self {
+        let (reader, mut writer) = frame_cluster_connection(connection);
+        let reader_task = tokio::spawn(async move {
+            let mut buf_reader = reader.ready_chunks(batch_size);
+            while let Some(messages) = buf_reader.next().await {
+                for msg in messages {
+                    if let Ok(m) = msg {
+                        if incoming_messages.send((peer_id, m)).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        error!("Error deserializing message on cluster3: {:?}", msg);
+                    }
+                }
+            }
+        });
+        let (message_tx, mut message_rx) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(async move {
+            let mut buffer = Vec::with_capacity(batch_size);
+            while message_rx.recv_many(&mut buffer, batch_size).await != 0 {
+                for msg in buffer.drain(..) {
+                    if let Err(err) = writer.feed(msg).await {
+                        error!("Couldn't send message to node {peer_id} on cluster3: {err}");
+                        break;
+                    }
+                }
+                if let Err(err) = writer.flush().await {
+                    error!("Couldn't flush messages to node {peer_id} on cluster3: {err}");
+                    break;
+                }
+            }
+            info!("Cluster3 connection to node {peer_id} closed");
+        });
+        Peer3Connection {
+            peer_id,
+            reader_task,
+            writer_task,
+            outgoing_messages: message_tx,
+        }
+    }
+
+    pub fn send(
+        &mut self,
+        msg: ClusterMessage,
+    ) -> Result<(), mpsc::error::SendError<ClusterMessage>> {
+        self.outgoing_messages.send(msg)
+    }
+
+    fn close(self) {
+        self.reader_task.abort();
+        self.writer_task.abort();
+    }
+}
+
 struct ClientConnection {
     client_id: ClientId,
     reader_task: JoinHandle<()>,
@@ -576,7 +741,7 @@ impl ClientConnection {
                     }
                 }
                 if let Err(err) = writer.flush().await {
-                    error!("Couldn't send message to client {client_id}: {err}");
+                    error!("Couldn't flush messages to client {client_id}: {err}");
                     error!("Killing connection to client {client_id}");
                     return;
                 }

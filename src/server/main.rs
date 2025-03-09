@@ -26,9 +26,10 @@ pub async fn main() {
 
     let base_url = "postgres://postgres@localhost:5432"; // Base DB URL
     let database = Arc::new(Database::new(base_url).await);
+    let database3 = Arc::new(Database::new(base_url).await);
 
 
-    let mut server = OmniPaxosServer::new(server_config.clone(), network, database).await;
+    let mut server = OmniPaxosServer::new(server_config.clone(), network, database, database3).await;
 
     server.run().await;
 }
