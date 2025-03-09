@@ -1032,6 +1032,7 @@ dependencies = [
 name = "omnipaxos-sql"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "config",
  "csv",
