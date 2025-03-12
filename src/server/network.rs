@@ -363,6 +363,27 @@ impl Network {
         }
     }
 
+    pub async fn recv_many(
+        &mut self,
+        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
+        client_msg_buf: &mut Vec<(ClientId, ClientMessage)>,
+        batch_size: usize,
+    ) {
+        let mut timeout_interval = tokio::time::interval(Duration::from_millis(5));
+
+        while cluster_msg_buf.len() < batch_size || client_msg_buf.len() < batch_size {
+            tokio::select! {
+                Some(msg) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
+                    cluster_msg_buf.push(msg);
+                }
+                Some(msg) = self.client_messages.recv(), if client_msg_buf.len() < batch_size => {
+                    client_msg_buf.push(msg);
+                }
+                _ = timeout_interval.tick() => break,
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn shutdown(&mut self) {
         for (_, client_connection) in self.client_connections.drain() {

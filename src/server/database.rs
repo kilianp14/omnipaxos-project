@@ -105,12 +105,17 @@ impl Database {
             .map(|i| format!("'{}'", i))
             .collect::<Vec<String>>()
             .join(", ");
-        let query_str = format!(
-            "BEGIN; INSERT INTO {} ({}) VALUES ({}) RETURNING id; PREPARE TRANSACTION '{}';",
-            command.table, columns, values, id
-        );
 
+        let query_str = "BEGIN";
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
+
+        // Execute your insert.
+        let insert_query = format!("INSERT INTO {} ({}) VALUES ({})", command.table, columns, values);
+        let result: Option<PgQueryResult> = query(&insert_query).execute(&self.pool).await.ok();
+
+        // Prepare the transaction to make it pending.
+        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
+        let result: Option<PgQueryResult> = query(&prepare_query).execute(&self.pool).await.ok();
 
         match result {
             Some(res) => Some(format!("Inserted {} rows", res.rows_affected())),
@@ -127,14 +132,20 @@ impl Database {
             .map(|((col, _), val)| format!("{} = '{}'", col, val))
             .collect();
 
+        let query_str = "BEGIN";
+        let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
+
         let set_clause = assignments.join(", ");
         let condition = command.conditions.unwrap_or("TRUE".to_string());
         let query_str = format!(
-            "BEGIN; UPDATE {} SET {} WHERE {} RETURNING id; PREPARE TRANSACTION '{}';",
-            command.table, set_clause, condition, id
+            "UPDATE {} SET {} WHERE {} RETURNING id;",
+            command.table, set_clause, condition
         );
-
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
+
+        // Prepare the transaction to make it pending.
+        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
+        let result: Option<PgQueryResult> = query(&prepare_query).execute(&self.pool).await.ok();
 
         match result {
             Some(res) => Some(format!("Updated {} rows", res.rows_affected())),
@@ -143,13 +154,20 @@ impl Database {
     }
 
     async fn handle_delete(&self, command: SqlCommand, id:CommandId) -> Option<String> {
+        let query_str = "BEGIN";
+        let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
+
         let condition = command.conditions.unwrap_or("TRUE".to_string());
         let query_str = format!(
-            "BEGIN; DELETE FROM {} WHERE {} RETURNING id; PREPARE TRANSACTION '{}';",
-            command.table, condition, id
+            "DELETE FROM {} WHERE {} RETURNING id;",
+            command.table, condition
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
+
+        // Prepare the transaction to make it pending.
+        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
+        let result: Option<PgQueryResult> = query(&prepare_query).execute(&self.pool).await.ok();
 
         match result {
             Some(res) => Some(format!("Updated {} rows", res.rows_affected())),
@@ -165,10 +183,9 @@ impl Database {
             .collect();
 
         let query_str = format!(
-            "BEGIN; CREATE TABLE IF NOT EXISTS {} ({}); PREPARE TRANSACTION '{}';",
+            "CREATE TABLE IF NOT EXISTS {} ({})",
             command.table,
-            columns_definitions.join(", "),
-            id
+            columns_definitions.join(", ")
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
