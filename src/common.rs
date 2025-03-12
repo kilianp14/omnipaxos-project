@@ -11,6 +11,7 @@ pub mod messages {
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
         NodeRegister2(NodeId),
+        NodeRegister3(NodeId),
         ClientRegister,
     }
 
@@ -19,7 +20,7 @@ pub mod messages {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
         ReadRequest(NodeId, NodeId, CommandId, SqlCommand),
-        ReadResponse(NodeId, CommandId, Option<String>),
+        ReadResponse(NodeId, NodeId, CommandId, Option<String>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]

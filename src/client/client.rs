@@ -128,7 +128,7 @@ impl Client {
         } else {
             self.next_request_id - 1
         };
-        let keys: Vec<String> = (prev_key..=prev_key + 8).map(|k| k.to_string()).collect(); // some test keys to do cross shard transactions
+        let keys: Vec<String> = (prev_key..=prev_key + 4).map(|k| k.to_string()).collect(); // some test keys to do cross shard transactions
         let key = self.next_request_id.to_string();
         let cmd = match query_type {
             QueryType::Create => SqlCommand::create_table_cmd(),

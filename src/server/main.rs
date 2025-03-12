@@ -28,18 +28,18 @@ pub async fn main() {
     let network = Arc::new(Mutex::new(Network::new(server_config.clone(), NETWORK_BATCH_SIZE).await));
 
     let base_url = "postgres://postgres@localhost:5432"; // Base DB URL
-    let database = Arc::new(Database::new(base_url).await);
+    let database1 = Arc::new(Database::new(base_url).await);
+    let database2 = Arc::new(Database::new(base_url).await);
 
-    let (tx_shard, rx_shard) = mpsc::channel();
+    let (tx_shard1, rx_shard1) = mpsc::channel();
+    let (tx_shard2, rx_shard2) = mpsc::channel();
     let (tx_server, rx_server) = mpsc::channel();
 
-    let mediator = Mediator::new(tx_shard.clone(), tx_server.clone());
+    let mediator = Mediator::new(tx_shard1.clone(), tx_shard2.clone(), tx_server.clone());
 
-    let mut shard = Shard::new(server_config.clone(), database, network.clone(), mediator.clone()).await;
+    let mut shard1 = Shard::new(server_config.clone(), database1, network.clone(), mediator.clone(),1).await;
+    let mut shard2 = Shard::new(server_config.clone(), database2, network.clone(), mediator.clone(),2).await;
     let mut server = OmniPaxosServer::new(server_config.clone(), network.clone(),mediator).await;
-
-    // shard.run_mpsc(rx_shard);
-    // server.run_mpsc(rx_server);
 
     // server.run().await;
 
@@ -47,19 +47,13 @@ pub async fn main() {
         server.run(rx_server).await;
     });
 
-    let shard_task = tokio::spawn(async move {
-        shard.run(rx_shard).await;
+    let shard_task1 = tokio::spawn(async move {
+        shard1.run(rx_shard1).await;
     });
 
-    tokio::join!(server_task, shard_task);
-    
+    let shard_task2 = tokio::spawn(async move {
+        shard2.run(rx_shard2).await;
+    });
 
-    // let test = server.clone();
-    // let mut server_task = test.lock().await;
-
-  
-    // join!(server_task.run(), async {
-    //     let mut shard_guard = shard.lock().await;
-    //     shard_guard.run().await
-    // });
+    tokio::join!(server_task, shard_task1, shard_task2);
 }

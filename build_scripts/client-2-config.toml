@@ -8,7 +8,7 @@ output_filepath = "./logs/client-2.csv"
 [[requests]]
 duration_sec = 10
 requests_per_sec = 1
-read_ratio = 0.25
+read_ratio = 1
 
 
 

@@ -6,6 +6,7 @@ use omnipaxos::{
     util::{LogEntry, NodeId},
     OmniPaxos, OmniPaxosConfig,
 };
+use serde::de::value::U64Deserializer;
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::thread;
 use omnipaxos_sql::common::{messages::*, sql::*, utils::Timestamp};
@@ -21,84 +22,42 @@ type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
-const SHARD_TIMEOUT: Duration = Duration::from_secs(1);
-
-
-// Define a callback trait with an async function.
-// #[async_trait]
-// #[async_trait]
-// pub trait ServerCallback: Send + Sync {
-//     // async fn send_to_cluster2(&self, sender_Id: NodeId, msg: ClusterMessage);
-//     // async fn send_to_client(&self, client_id: ClientId, msg: ServerMessage);
-//     async fn ack_from_shard(&self, command_id: CommandId);
-// }
-
-// #[async_trait]
-// impl ServerCallback for tokio::sync::Mutex<OmniPaxosServer> {
-//     // async fn send_to_cluster2(&self, sender_Id: NodeId, msg: ClusterMessage) {
-//     //     let guard = self.lock().await;
-//     //     guard.send_to_cluster2(sender_Id, msg).await;
-
-//     // }
-//     // async fn send_to_client(&self, client_id: ClientId, msg: ServerMessage) {
-//     //     let guard = self.lock().await;
-//     //     let mut net = guard.network.lock().await;
-//     //     net.send_to_client(client_id, msg);
-//     // }
-//     async fn ack_from_shard(&self, command_id: CommandId) {
-//         let mut guard = self.lock().await;
-//         guard.ack_from_shard(command_id);
-//     }
-// }
+const SHARD_TIMEOUT: Duration = Duration::from_millis(100);
 
 
 pub struct Shard {
     id: NodeId,
     network: Arc<tokio::sync::Mutex<Network>>,
     database: Arc<Database>,
-    // omnipaxos: OmniPaxosInstance,
-    // omnipaxos_msg_buffer: Vec<Message<Command>>,
-    // New second omnipaxos instance and its message buffer
-    omnipaxos2: OmniPaxosInstance,
-    omnipaxos_msg_buffer2: Vec<Message<Command>>,
-    // current_decided_idx: usize,
+    omnipaxos: OmniPaxosInstance,
+    omnipaxos_msg_buffer: Vec<Message<Command>>,
     current_decided_shard_idx: usize,
     config: OmniPaxosSqlConfig,
     peers: Vec<NodeId>,
-    // callback: Option<Arc<dyn ServerCallback>>,
     mediator: Mediator,
+    shard_id: i32,
 }
     
 
 impl Shard {
-    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>, network: Arc<tokio::sync::Mutex<Network>>,mediator: Mediator) -> Self {
-        // Initialize first OmniPaxos instance
-        // let storage: MemoryStorage<Command> = MemoryStorage::default();
-        // let omnipaxos_config: OmniPaxosConfig = config.clone().into();
-        // let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
-        // let omnipaxos = omnipaxos_config.build(storage).unwrap();
-
-        // Initialize second OmniPaxos instance (separate from the first one)
-        let storage2: MemoryStorage<Command> = MemoryStorage::default();
-        let omnipaxos_config2: OmniPaxosConfig = config.clone().into();
-        let omnipaxos_msg_buffer2 = Vec::with_capacity(omnipaxos_config2.server_config.buffer_size);
-        let omnipaxos2 = omnipaxos_config2.clone().build(storage2).unwrap();
+    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>, network: Arc<tokio::sync::Mutex<Network>>,mediator: Mediator, shard_id:i32) -> Self {
+        let storage: MemoryStorage<Command> = MemoryStorage::default();
+        let omnipaxos_config: OmniPaxosConfig = config.clone().into();
+        let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
+        let omnipaxos = omnipaxos_config.clone().build(storage).unwrap();
 
 
         Shard {
             id: config.local.server_id,
             network,
             database,
-            // omnipaxos,
-            // omnipaxos_msg_buffer,
-            omnipaxos2,
-            omnipaxos_msg_buffer2,
-            // current_decided_idx: 0,
+            omnipaxos,
+            omnipaxos_msg_buffer,
             current_decided_shard_idx: 0,
             peers: config.get_peers(config.local.server_id),
             config,
-            // callback: None,
             mediator,
+            shard_id
         }
     }
 
@@ -110,11 +69,9 @@ impl Shard {
         // Save config to output file
         self.save_output().expect("Failed to write to file");
 
-        // let mut client_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
-        // let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
-        let mut cluster2_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
+        let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         // We don't use Omnipaxos leader election at first and instead force a specific initial leader
-        self.establish_initial_leader(&mut cluster2_msg_buf).await;
+        self.establish_initial_leader(&mut cluster_msg_buf).await;
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
         // let mut shardTimeoutInterval = tokio::time::interval(SHARD_TIMEOUT);
@@ -122,16 +79,18 @@ impl Shard {
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
-                    // self.omnipaxos.tick();
-                    // self.send_outgoing_msgs().await;
-                    self.omnipaxos2.tick();
-                    self.send_outgoing_msgs2().await;
+                    self.omnipaxos.tick();
+                        self.send_outgoing_msgs().await;
                 },
                 _ = async {
                     let mut net = self.network.lock().await;
-                    net.cluster2_messages.recv_many(&mut cluster2_msg_buf, NETWORK_BATCH_SIZE).await
+                    if self.shard_id == 1 {
+                        net.cluster2_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE).await
+                    } else {
+                        net.cluster3_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE).await
+                    }
                 } => {
-                    self.handle_cluster2_messages(&mut cluster2_msg_buf).await;
+                    self.handle_cluster_messages(&mut cluster_msg_buf).await;
                 },
                 // _ = async {
                 //     if let Some(callback) = &self.callback {
@@ -168,84 +127,41 @@ impl Shard {
         }
     }
 
-    
-    // pub async fn run_mpsc(&self, rx: Receiver<MediatorMessage>) {
-    //     tokio::spawn(async move {
-    //         for message in rx {
-    //             if let MediatorMessage::PrepareFromServer(cmd) = message.clone() {
-    //                 // println!("Shard received: Prepare from server{:?}", cmd);
-    //                 self.send_prepare_to_shard(cmd).await;
-    //             }
-    //             if let MediatorMessage::CommitOrAbortFromServer(cmd) = message {
-    //                 println!("Shard received: commit or abort from server{:?}", cmd);
-    //             }
-    //         }
-    //     });
-    // }
-
     // Ensures cluster is connected and initial leader is promoted before returning.
     // Once the leader is established it chooses a synchronization point which the
     // followers relay to their clients to begin the experiment.
     async fn establish_initial_leader(
         &mut self,
-        cluster2_msg_buffer: &mut Vec<(NodeId, ClusterMessage)>,
+        cluster_msg_buffer: &mut Vec<(NodeId, ClusterMessage)>,
     ) {
-        // let mut leader_takeover_interval = tokio::time::interval(LEADER_WAIT);
-        let mut leader_takeover_interval2 = tokio::time::interval(LEADER_WAIT);
-        // loop {
-        //     tokio::select! {
-        //         _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
-        //             if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
-        //                 if curr_leader == self.id && is_accept_phase {
-        //                     info!("{}: Leader coodinator fully initialized", self.id);
-        //                     let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
-        //                     self.send_cluster_start_signals(experiment_sync_start).await;
-        //                     self.send_client_start_signals(experiment_sync_start).await;
-        //                     break;
-        //                 }
-        //             }
-        //             info!("{}: Attempting to take leadership for coordinator", self.id);
-        //             self.omnipaxos.try_become_leader();
-        //             self.send_outgoing_msgs().await;
-        //         },
-        //         _ = async {
-        //             self.network.cluster_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE).await
-        //         } => {
-        //             let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
-        //             if recv_start {
-        //                 break;
-        //             }
-        //         },
-        //         _ = async {
-        //             self.network.client_messages.recv_many(client_msg_buffer, NETWORK_BATCH_SIZE).await
-        //         } => {
-        //             self.handle_client_messages(client_msg_buffer).await;
-        //         },
-        //     }
-        // }
+        let mut leader_takeover_interval = tokio::time::interval(LEADER_WAIT);
         
-        // get the shards leader
         loop {
             tokio::select! {
-                _ = leader_takeover_interval2.tick(), if self.config.cluster.initial_leader == self.id => {
-                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos2.get_current_leader(){
+                _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
+                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
                         if curr_leader == self.id && is_accept_phase {
                             info!("{}: Leader shard fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
-                            self.send_cluster2_start_signals(experiment_sync_start).await;
+                            self.send_cluster_start_signals(experiment_sync_start).await;
                             // self.send_client_start_signals(experiment_sync_start).await;
                             break;
                         }
                     }
                     info!("{}: Attempting to take leadership for shard", self.id);
-                    self.omnipaxos2.try_become_leader();
-                    self.send_outgoing_msgs2().await;
+                    self.omnipaxos.try_become_leader();
+                    self.send_outgoing_msgs().await;
                 },
                 _ = async {
-                    let mut network = self.network.lock().await;
-                    network.cluster2_messages.recv_many(cluster2_msg_buffer, NETWORK_BATCH_SIZE).await
+                    if self.shard_id == 1 {
+                        self.network.lock().await.cluster2_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE).await
+                    } else {
+                        self.network.lock().await.cluster3_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE).await
+                    }
+                    // let mut network = self.network.lock().await;
+                    // network.cluster2_messages.recv_many(cluster2_msg_buffer, NETWORK_BATCH_SIZE).await
                 } => {
-                    let recv_start = self.handle_cluster2_messages(cluster2_msg_buffer).await;
+                    let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
                     if recv_start {
                         break;
                     }
@@ -266,7 +182,7 @@ impl Shard {
     }
 
     // shard
-    async fn handle_cluster2_messages(
+    async fn handle_cluster_messages(
         &mut self,
         messages: &mut Vec<(NodeId, ClusterMessage)>,
     ) -> bool {
@@ -274,7 +190,7 @@ impl Shard {
         for (from, message) in messages.drain(..) {
             match message {
                 ClusterMessage::OmniPaxosMessage(m) => {
-                    self.omnipaxos2.handle_incoming(m);
+                    self.omnipaxos.handle_incoming(m);
                     self.handle_decided_shard_entries().await;
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
@@ -284,34 +200,34 @@ impl Shard {
                 }
                 ClusterMessage::ReadRequest(client_id, sender_id, command_id, sql_command) => {
                     let response = self.database.prepare_command(sql_command, command_id).await;
-                    let msg = ClusterMessage::ReadResponse(client_id, command_id, response);
-                    // if let Some(callback) = &self.callback {
-                    //     callback.send_to_cluster2(sender_id, msg).await;
-                    // }
+                    let msg = ClusterMessage::ReadResponse(client_id, sender_id, command_id, response);
                     let mut network = self.network.lock().await;
-                    network.send_to_cluster2(sender_id, msg);
+                    if self.shard_id == 1 {
+                        network.send_to_cluster2(sender_id, msg);
+                    } else {
+                        network.send_to_cluster3(sender_id, msg);
+                    }
                 }
-                ClusterMessage::ReadResponse(client_id, command_id, response) => {
-                    let msg = ServerMessage::Answer(command_id, response);
-                    // if let Some(callback) = &self.callback {
-                    //     callback.send_to_client(client_id, msg).await;
-                    // }
-                    let mut network = self.network.lock().await;
-                    network.send_to_client(client_id, msg);
+                ClusterMessage::ReadResponse(client_id, coord_id, command_id, response) => {
+                    // will be always the shard that also send the cluster so we can jsut return result to our own coordinator
+                    // This is due to the fact that a ReadRequest responds with the result to the shard first, who then forwards it to its own coordaintor, who also sent the query originally. We could skip this step over the intermediate shard, but this is also fine. (one more message)
+                    let msg = ClusterMessage::ReadResponse(client_id, coord_id, command_id, response);
+                    info!("{} sending from shard {} to {}", self.id, self.id, coord_id);
+                    self.mediator.response_from_shard(msg);
                 }
             }
         }
-        self.send_outgoing_msgs2().await;
+        self.send_outgoing_msgs().await;
         received_start_signal
     }
 
     // shard
     async fn handle_decided_shard_entries(&mut self) {
         // TODO: Can use a read_raw here to avoid allocation
-        let new_decided_idx = self.omnipaxos2.get_decided_idx();
+        let new_decided_idx = self.omnipaxos.get_decided_idx();
         if self.current_decided_shard_idx < new_decided_idx {
             let decided_entries = self
-                .omnipaxos2
+                .omnipaxos
                 .read_decided_suffix(self.current_decided_shard_idx)
                 .unwrap();
             self.current_decided_shard_idx = new_decided_idx;
@@ -322,45 +238,55 @@ impl Shard {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands).await;
+            self.update_database_and_respond(decided_commands, true).await;     // is_decided boolean = true means that we expect the shard to respond with the result to the coordiantor the query came from. (This is the case if we are doing a linearizable read)
         }
     }
 
-    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
+    async fn update_database_and_respond(&mut self, commands: Vec<Command>, is_decided: bool) {
         // TODO: batching responses possible here (batch at handle_cluster_messages)
         // This todo was already in the repo, dont think we actually need to do batching
         // For now lets just do write-through
         for command in commands {
             let response = match command.phase {
-                Some(Phase::Prepare) => self.database.prepare_command(command.sql_cmd, command.id).await,
+                Some(Phase::Prepare) => self.database.prepare_command(command.sql_cmd.clone(), command.id).await,
                 Some(Phase::Commit) => self.database.commit_command(command.id).await,
                 Some(Phase::Abort) => self.database.abort_command(command.id).await,
                 None => None,
             };
 
-            if command.coordinator_id == self.id {
-                match command.phase {
-                    Some(Phase::Prepare) => {
-                        info!("{} shard: Acknowledging command {}", self.id, command.id);
-                        // if let Some(callback) = &self.callback {
-                        //     callback.ack_from_shard(command.id).await;
-                        // }
-                        // self.ack_from_shard(command.id);
-                        self.mediator.ack_from_shard(command.id);
+            if is_decided {
+                if command.coordinator_id == self.id {
+                    match command.phase {
+                        Some(Phase::Prepare) => {
+                            match command.sql_cmd.query_type {
+                                QueryType::Select => {
+                                    // TODO: this is teh only case where the read result is not coming from the same shard process as the coordinator send it
+                                    let msg = ClusterMessage::ReadResponse(command.client_id, command.coordinator_id, command.id, response);
+                                    let mut network = self.network.lock().await;
+                                    info!("{} sending from shard {} to {}", self.id, self.id,command.coordinator_id);
+                                    network.send_to_cluster(command.coordinator_id, msg);
+                                    match command.sql_cmd.consistency.unwrap() {
+                                        Consistency::Linearizable => {
+                                            info!("{} shard: Acknowledging command (that is linerarizable) {}", self.id, command.id);
+                                            self.mediator.ack_from_shard(command.id);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                _ => {
+                                    info!("{} shard: Acknowledging command {}", self.id, command.id);
+                                    self.mediator.ack_from_shard(command.id);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-                let msg = ServerMessage::Answer(command.id, response);
-                // if let Some(callback) = &self.callback {
-                //     callback.send_to_client(command.client_id, msg).await;
-                // }
-                let mut network = self.network.lock().await;
-                network.send_to_client(command.client_id, msg);
             }
         }
     }
     
-    fn append_to_log2(&mut self, from: ClientId, command_id: CommandId, sql_command: SqlCommand, phase: Phase) {
+    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: SqlCommand, phase: Phase) {
         let command = Command {
             client_id: from,
             coordinator_id: self.id,
@@ -368,36 +294,38 @@ impl Shard {
             sql_cmd: sql_command,
             phase: Some(phase),
         };
-        self.omnipaxos2
+        self.omnipaxos
             .append(command)
             .expect("Append to Omnipaxos log failed");
     }
 
 
     // Sends outgoing messages from the second omnipaxos instance using the cluster2 channel
-    async fn send_outgoing_msgs2(&mut self) {
-        self.omnipaxos2.take_outgoing_messages(&mut self.omnipaxos_msg_buffer2);
-        for msg in self.omnipaxos_msg_buffer2.drain(..) {
+    async fn send_outgoing_msgs(&mut self) {
+        self.omnipaxos.take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
+        for msg in self.omnipaxos_msg_buffer.drain(..) {
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            // if let Some(callback) = &self.callback {
-            //     callback.send_to_cluster2(to, cluster_msg).await;
-            // }
             let mut network = self.network.lock().await;
-            network.send_to_cluster2(to, cluster_msg);
+            if self.shard_id == 1 {
+                network.send_to_cluster2(to, cluster_msg);
+            } else {
+                network.send_to_cluster3(to, cluster_msg);
+            }
         }
     }
 
 
-    async fn send_cluster2_start_signals(&mut self, start_time: Timestamp) {
+    async fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
         for peer in &self.peers {
             debug!("Sending start message to peer {peer}");
             let msg = ClusterMessage::LeaderStartSignal(start_time);
-            // if let Some(callback) = &self.callback {
-            //     callback.send_to_cluster2(*peer, msg).await;
-            // }
             let mut network = self.network.lock().await;
-            network.send_to_cluster2(*peer, msg);
+            if self.shard_id == 1 {
+                network.send_to_cluster2(*peer, msg);
+            } else if self.shard_id == 2 {
+                network.send_to_cluster3(*peer, msg);
+            }
         }
     }
 
@@ -406,24 +334,25 @@ impl Shard {
         let sql_cmd = command.sql_cmd.clone();
         match sql_cmd.query_type {
             QueryType::Select => {
-                self.handle_read_message(command.client_id, command.id, sql_cmd).await;
-                // self.ack_from_shard(command.id);
+                self.handle_read_message(command.client_id, command.coordinator_id, command.id, sql_cmd).await;
             }
             _ => {
-                self.append_to_log2(command.client_id, command.id, sql_cmd, command.phase.unwrap());
+                self.append_to_log(command.client_id, command.id, sql_cmd, command.phase.unwrap());
             }
         }
-        self.send_outgoing_msgs2().await;
+        self.send_outgoing_msgs().await;
     }
 
     pub async fn commit_or_abort_on_shard(&mut self, command: Command) {
-        self.update_database_and_respond(vec![command]).await;
+        // is decided is false here as this value is imposed by the coordiantor. aggrement is ensured as this was already proposed earlier in the 2pc protocoll. the is_decide boolean contolls wether to respond to the coordinaot with te result. which we only need if the value was freshly decided by omnipaxos (we did a Linearizable Read)
+        self.update_database_and_respond(vec![command], false).await;
     }
 
     // shard
     async fn handle_read_message(
         &mut self,
         client_id: ClientId,
+        coordinator_id: NodeId,
         command_id: CommandId,
         sql_command: SqlCommand,
     ) {
@@ -435,26 +364,18 @@ impl Shard {
             Consistency::Local => {
                 // Read from local DB directly
                 let response = self.database.prepare_command(sql_command, command_id).await;
-                let msg = ServerMessage::Answer(command_id, response);
-                // if let Some(callback) = &self.callback {
-                //     callback.send_to_client(client_id, msg).await;
-                // }
-                let mut network = self.network.lock().await;
-                network.send_to_client(client_id, msg);
-                // self.ack_from_shard(command_id);
+                let msg = ClusterMessage::ReadResponse(client_id, coordinator_id, command_id, response);
+                info!("{} sending from shard {} to {}", self.id, self.id,coordinator_id);
+                self.mediator.response_from_shard(msg);    // send response back to the coorinator the request came from
             }
             Consistency::Leader => {
-                if let Some((leader_id, is_accept_phase)) = self.omnipaxos2.get_current_leader() {
+                if let Some((leader_id, is_accept_phase)) = self.omnipaxos.get_current_leader() {
                     if leader_id == self.id && is_accept_phase {
                         // We are the leader, process locally
                         let response = self.database.prepare_command(sql_command, command_id).await;
-                        let msg = ServerMessage::Answer(command_id, response);
-                        // if let Some(callback) = &self.callback {
-                        //     callback.send_to_client(client_id, msg).await;
-                        // }
-                        let mut network = self.network.lock().await;
-                        network.send_to_client(client_id, msg);
-                        // self.ack_from_shard(command_id);
+                        let msg = ClusterMessage::ReadResponse(client_id, coordinator_id, command_id, response);
+                        info!("{} sending from shard {} to {}", self.id, self.id,coordinator_id);
+                        self.mediator.response_from_shard(msg);    // send response back to the coorinator the request came from
                     } else {
                         // Forward to leader
                         let forward_msg = ClusterMessage::ReadRequest(
@@ -464,11 +385,12 @@ impl Shard {
                             sql_command,
                         );
                         info!("{}: Forwarding read request to leader {}", self.id, leader_id);
-                        // if let Some(callback) = &self.callback {
-                        //     callback.send_to_cluster2(leader_id, forward_msg).await;
-                        // }
                         let mut network = self.network.lock().await;
-                        network.send_to_cluster2(leader_id, forward_msg);
+                        if self.shard_id == 1 {
+                            network.send_to_cluster2(leader_id, forward_msg);
+                        } else if self.shard_id == 2 {
+                            network.send_to_cluster3(leader_id, forward_msg);
+                        }
                     }
                 }
             }
@@ -483,7 +405,7 @@ impl Shard {
                     phase: None,
                 };
                 // Append the read command to the log to ensure linearizability
-                match self.omnipaxos2.append(read_command) {
+                match self.omnipaxos.append(read_command) {
                     Ok(_) => {
                         // TODO: Verify this works as expected.
                         // The read will be processed when it's decided
@@ -491,14 +413,14 @@ impl Shard {
                         // in update_database_and_respond when the command is decided
                     }
                     Err(e) => {
-                        //TODO:send abort to coordinator
-                        let response = format!("Failed to achieve linearizable read: {:?}", e);
-                        let msg = ServerMessage::Answer(command_id, Some(response));
-                        // if let Some(callback) = &self.callback {
-                        //     callback.send_to_client(client_id, msg).await;
-                        // }
-                        let mut network = self.network.lock().await;
-                        network.send_to_client(client_id, msg);
+                        // TODO: implement this special case to respond to the coordinator with a special abort message, that removes this transaction from the pending transactions vector and sends abort to client
+
+                        // let response = format!("Failed to achieve linearizable read: {:?}", e);
+                        // let msg = ClusterMessage::ReadResponse(client_id, coordinator_id, command_id, Some(response));
+                        // // let mut network = self.network.lock().await;
+                        // info!("{} sending from shard {} to {}", self.id, self.id,coordinator_id);
+                        // // network.send_to_cluster(coordinator_id, msg);        // send back to the coorinator the request came from
+                        // self.mediator.response_from_shard(msg);
                     }
                 }
             }

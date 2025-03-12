@@ -1,3 +1,4 @@
+use log::info;
 use omnipaxos_sql::common::sql::{Phase, QueryType, SqlCommand, CommandId};
 use sqlx::{postgres::PgQueryResult, query, query_as, Executor, PgPool};
 use uuid::Uuid;
@@ -82,7 +83,11 @@ impl Database {
             columns, command.table, keys_str
         );
 
+
+
         let rows: Option<Vec<(String,)>> = query_as(&query_str).fetch_all(&self.pool).await.ok();
+        info!("Query: {}", query_str);
+        info!("Rows: {:?}", rows);
 
         match rows {
             Some(values) => {
