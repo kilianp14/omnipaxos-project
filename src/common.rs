@@ -77,7 +77,7 @@ pub mod sql {
         pub table: String,
         pub columns: Vec<(String, String)>, // this is column name, type
         pub values: Option<Vec<String>>,
-        pub conditions: Option<String>,
+        pub keys: Option<Vec<String>>,
         pub consistency: Option<Consistency>,
     }
 
@@ -92,7 +92,7 @@ pub mod sql {
                     ("value".to_string(), "text".to_string()),
                 ],
                 values: None,
-                conditions: None,
+                keys: None,
                 consistency: None,
             }
         }
@@ -105,18 +105,18 @@ pub mod sql {
                     ("value".to_string(), "text".to_string()),
                 ],
                 values: Some(vec![key.clone(), format!("{}_value_{}", client_id, key)]),
-                conditions: None,
+                keys: None,
                 consistency: None,
             }
         }
 
-        pub fn select_cmd(key: String, consistency: Consistency) -> Self {
+        pub fn select_cmd(keys: Vec<String>, consistency: Consistency) -> Self {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
                 columns: vec![("value".to_string(), "text".to_string())],
                 values: None,
-                conditions: Some(format!("key = '{}'", key)),
+                keys: Some(keys),
                 consistency: Some(consistency),
             }
         }

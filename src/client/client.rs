@@ -128,13 +128,14 @@ impl Client {
         } else {
             self.next_request_id - 1
         };
+        let keys: Vec<String> = (prev_key..=prev_key + 8).map(|k| k.to_string()).collect(); // some test keys to do cross shard transactions
         let key = self.next_request_id.to_string();
         let cmd = match query_type {
             QueryType::Create => SqlCommand::create_table_cmd(),
             QueryType::Insert => SqlCommand::insert_cmd(self.id.to_string() , key),
             // It's not very interesting to select a key that doesn't exist, so we'll just select the previous key.
             // TODO use different consistency levels for reads.
-            _ => SqlCommand::select_cmd(prev_key.to_string(), Consistency::Leader),
+            _ => SqlCommand::select_cmd(keys, Consistency::Leader),
         };
         let request = ClientMessage::Handle(self.next_request_id, cmd.clone());
         debug!("Sending {request:?}");

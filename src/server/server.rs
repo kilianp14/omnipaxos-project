@@ -446,8 +446,8 @@ impl OmniPaxosServer {
             table: "dummy".to_string(),
             columns: vec![("dummy".to_string(), "dummy".to_string())],
             consistency: Some(Consistency::Linearizable),
-            conditions: Some(String::new()),
-            values: Some(vec![]),
+            keys: Some(vec!["dummy".to_string()]),
+            values: Some(vec!["dummy".to_string()]),
         };      // A dummy command as we only need the transaction id in sql to commit or rollback the command. Therefore this command is never used.
 
         let completed_transactions: Vec<(Timestamp, CommandId, ClientId, Vec<bool>)> = self.pending_transactions

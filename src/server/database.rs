@@ -71,10 +71,15 @@ impl Database {
             .map(|(col, _)| col)
             .collect::<Vec<String>>()
             .join(", ");
-        let condition = command.conditions.unwrap_or("TRUE".to_string());
+        let keys = command.keys.unwrap_or_default();
+        let keys_str = keys
+            .into_iter()
+            .map(|key| format!("'{}'", key))
+            .collect::<Vec<String>>()
+            .join(", ");
         let query_str = format!(
-            "SELECT {} FROM {} WHERE {}",
-            columns, command.table, condition
+            "SELECT {} FROM {} WHERE key IN ({})",
+            columns, command.table, keys_str
         );
 
         let rows: Option<Vec<(String,)>> = query_as(&query_str).fetch_all(&self.pool).await.ok();
@@ -136,10 +141,15 @@ impl Database {
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
 
         let set_clause = assignments.join(", ");
-        let condition = command.conditions.unwrap_or("TRUE".to_string());
+        let keys = command.keys.unwrap_or_default();
+        let keys_str = keys
+            .into_iter()
+            .map(|key| format!("'{}'", key))
+            .collect::<Vec<String>>()
+            .join(", ");
         let query_str = format!(
-            "UPDATE {} SET {} WHERE {} RETURNING id;",
-            command.table, set_clause, condition
+            "UPDATE {} SET {} WHERE key IN ({}) RETURNING id;",
+            command.table, set_clause, keys_str
         );
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
 
@@ -157,10 +167,15 @@ impl Database {
         let query_str = "BEGIN";
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
 
-        let condition = command.conditions.unwrap_or("TRUE".to_string());
+        let keys = command.keys.unwrap_or_default();
+        let keys_str = keys
+            .into_iter()
+            .map(|key| format!("'{}'", key))
+            .collect::<Vec<String>>()
+            .join(", ");
         let query_str = format!(
-            "DELETE FROM {} WHERE {} RETURNING id;",
-            command.table, condition
+            "DELETE FROM {} WHERE key IN ({}) RETURNING id;",
+            command.table, keys_str
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
@@ -189,6 +204,23 @@ impl Database {
         );
 
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
+        
+        // Test insert values into all databases so we can do some cross shard reads
+        let insert_values: Vec<String> = (0..=20)
+            .map(|i| format!("({}, 'pre_written_{}')", i, i))
+            .collect();
+
+        let insert_query = format!(
+            "INSERT INTO {} (key, value) VALUES {}",
+            command.table,
+            insert_values.join(", ")
+        );
+
+        let result: Option<PgQueryResult> = query(&insert_query).execute(&self.pool).await.ok();
+
+        // Prepare the transaction to make it pending.
+        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
+        let result: Option<PgQueryResult> = query(&prepare_query).execute(&self.pool).await.ok();
 
         match result {
             Some(_) => Some(format!("Table {} rows", command.table)),

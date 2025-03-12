@@ -37,7 +37,7 @@ impl ClientData {
     pub fn new_request(&mut self, command: SqlCommand, command_id: CommandId) {
         let values = match command.query_type {
             QueryType::Insert => command.values.clone().map(|v| v.join(",")),
-            QueryType::Select => command.conditions,
+            QueryType::Select => command.keys.clone().map(|v| v.join(",")),
             _ => None,
         };
         let data = RequestData {
