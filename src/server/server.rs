@@ -275,28 +275,24 @@ impl OmniPaxosServer {
         for mut command in commands {
             if matches!(command.phase, Some(Phase::Prepare)) || command.phase.is_none() {
                 if command.coordinator_id == self.id {
-                    let (below_10, above_10): (Vec<String>, Vec<String>) = command.clone().sql_cmd.keys.unwrap_or_default().into_iter()
-                        .partition(|key| key.parse::<i32>().unwrap_or(0) < 10);
-
-                    // figre out how we can split the command for the writes.
-
-                    let mut number_of_involed_shards = 0;
-                    let mut cmd_below_10 = command.clone();
-                    let mut cmd_above_10 = command.clone();
-                    info!("{}: Processing command {:?}", self.id, command);
-                    if !below_10.is_empty() {
-                        cmd_below_10.sql_cmd.keys = Some(below_10.clone());
-                        number_of_involed_shards += 1;  
+                    if matches!(command.sql_cmd.query_type, QueryType::Create){
+                        self.pending_transactions.push((Utc::now().timestamp_millis(), command.id, command.client_id, vec![false]));
+                        command.phase = Some(Phase::Prepare);
+                        // create table has to be executed on every table and on every shard
+                        self.mediator.send_prepare_to_shard1(command.clone());
+                        self.mediator.send_prepare_to_shard2(command.clone());
                     }
-                    if !above_10.is_empty() {
-                        cmd_above_10.sql_cmd.keys = Some(above_10.clone());
-                        number_of_involed_shards += 1; 
+                    if matches!(command.sql_cmd.query_type, QueryType::Insert){
+                        let (number_of_involed_shards, mut cmd_below_10, mut cmd_above_10) = self.split_insert_command(command.clone());
+                        self.pending_transactions.push((Utc::now().timestamp_millis(), command.id, command.client_id, vec![false; number_of_involed_shards as usize]));
+                        self.mediator.send_prepare_to_shard1(cmd_below_10.clone());
+                        self.mediator.send_prepare_to_shard2(cmd_above_10.clone());
                     }
-                    info!("{}: Processing below command {:?}", self.id, cmd_below_10);
-                    info!("{}: push command {} to pending", self.id, command.id);
-                    // select tranactions are appended to the vector in order to keep track which shards already send the result back
-                    if matches!(command.sql_cmd.query_type, QueryType::Select) {
-                        self.pending_read_results.push((command.id, command.client_id, vec![], number_of_involed_shards));
+                    if matches!(command.sql_cmd.query_type, QueryType::Select){
+                        let (number_of_involed_shards, mut cmd_below_10, mut cmd_above_10) = self.split_select_command(command.clone());
+                        // select tranactions are appended to the vector in order to keep track which shards already send the result back
+                        self.pending_read_results.push((command.id, command.client_id, vec![], number_of_involed_shards as i32));     // this is for collecting the read results
+
                         match command.sql_cmd.consistency {
                             Some(Consistency::Linearizable) => {
                                 // linearizable read get decided so they can abort. whe need to keep track of the acks for that. like other write commands. But since its a read we also need to collect and merge all results
@@ -304,28 +300,21 @@ impl OmniPaxosServer {
                             }
                             _ => {}
                         }
-                    } else {
-                    // Insert and create transactions are appended to this vector, so we can periodically check if the acked and if not send a abort. For select queries we dont need to wait for acks as reading doesnt need to be decided.
-                        self.pending_transactions.push((Utc::now().timestamp_millis(), command.id, command.client_id, vec![false]));
-                    }
-                    info!("{}: Pending array: {:?}", self.id, self.pending_transactions);
-                    info!("{}: pending read results: {:?}", self.id, self.pending_read_results);
-                    command.phase = Some(Phase::Prepare);
-                    if matches!(command.sql_cmd.query_type, QueryType::Create) {
-                        // Ceate table hast to be send to all shards
-                        self.mediator.send_prepare_to_shard1(command.clone());
-                        self.mediator.send_prepare_to_shard2(command.clone());
-                    }else{
                         // TODO: reads have to wait until the table is created. otherwise the read will fail.
-                        if !below_10.is_empty() { 
-                            cmd_below_10.phase = Some(Phase::Prepare);
-                            self.mediator.send_prepare_to_shard1(command.clone()); // "sends" message to the shard1 to process
+                        command.phase = Some(Phase::Prepare);
+                        if !cmd_below_10.clone().sql_cmd.keys.unwrap().is_empty() { 
+                            self.mediator.send_prepare_to_shard1(cmd_below_10.clone()); // "sends" message to the shard1 to process
+                            // info!("{} send below ten to shard with command: {:?} ", self.id, cmd_below_10);
                         }
-                        if !above_10.is_empty() {
-                            cmd_above_10.phase = Some(Phase::Prepare);
-                            self.mediator.send_prepare_to_shard2(command.clone()); // "sends" message to the shard2 to process
+                        if !cmd_above_10.clone().sql_cmd.keys.unwrap().is_empty() {
+                            self.mediator.send_prepare_to_shard2(cmd_above_10.clone()); // "sends" message to the shard2 to process
+                            // info!("{} send above ten to shard with command: {:?} ", self.id, cmd_above_10);
+
                         }
                     }
+                    info!("{}: push command {} to pending", self.id, command.id);
+                    info!("{}: pending_transactions {:?}", self.id, self.pending_transactions);
+                    info!("{}: pending_read_results {:?}", self.id, self.pending_read_results);
                 }
             } else {
                 match command.phase {
@@ -344,6 +333,170 @@ impl OmniPaxosServer {
                 self.mediator.commit_or_abort_on_shard2(command);
             }
         }
+    }
+
+    // how to split a select command for the shards
+    fn split_select_command(&mut self, command:Command) -> (usize, Command, Command) {
+        let mut number_of_involed_shards = 0;
+        let mut cmd_below_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id,
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: command.sql_cmd.values.clone(),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+        let mut cmd_above_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id.clone(),
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: command.sql_cmd.values.clone(),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+    
+        let (below_10, above_10): (Vec<String>, Vec<String>) = command.clone().sql_cmd.keys.unwrap_or_default().into_iter()
+            .partition(|key| key.parse::<i32>().unwrap_or(0) < 10);
+    
+        // info!("{}: below vector is: {:?}", self.id, below_10);
+        // info!("{}: above vector is: {:?}", self.id, above_10);
+    
+        if !below_10.is_empty() {
+            cmd_below_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type.clone(),
+                    table: command.sql_cmd.table.clone(),
+                    columns: command.sql_cmd.columns.clone(),
+                    values: command.sql_cmd.values.clone(),
+                    keys: Some(below_10.clone()),
+                    consistency: command.sql_cmd.consistency.clone(),
+                },
+                phase: None,
+            };
+            number_of_involed_shards += 1;  
+        }
+        if !above_10.is_empty() {
+            cmd_above_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type,
+                    table: command.sql_cmd.table,
+                    columns: command.sql_cmd.columns,
+                    values: command.sql_cmd.values,
+                    keys: Some(above_10.clone()),
+                    consistency: command.sql_cmd.consistency,
+                },
+                phase: None,
+            };
+            number_of_involed_shards += 1; 
+        }
+        
+        // info!("{}: below vector is: {:?}", self.id, cmd_above_10.sql_cmd.keys);
+        // info!("{}: above vector is: {:?}", self.id, cmd_below_10.sql_cmd.keys);
+        (number_of_involed_shards, cmd_below_10, cmd_above_10)
+    }   
+
+    // split insert command into its ranges for the shards
+    fn split_insert_command(&mut self, command:Command) -> (usize, Command, Command) {
+        let mut number_of_involed_shards = 0;
+        let mut cmd_below_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id,
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: Some(Vec::new()),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+        let mut cmd_above_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id,
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: Some(Vec::new()),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+
+        let values = command.sql_cmd.values.clone().unwrap_or_default();
+        let (below_10, above_10): (Vec<String>, Vec<String>) = values.into_iter().partition(|s| {
+            // Remove parentheses then split by comma.
+            let trimmed = s.trim_matches(|c| c == '(' || c == ')');
+            let parts: Vec<&str> = trimmed.split(',').collect();
+            let num_str = parts.get(0).unwrap().trim().trim_matches('\'');
+            num_str.parse::<i32>().unwrap_or(0) < 10
+        });
+
+        // info!("{}: below vector is: {:?}", self.id, below_10);
+        // info!("{}: above vector is: {:?}", self.id, above_10);
+
+        if !below_10.is_empty() {
+            // cmd_below_10.sql_cmd.values = Some(below_10);
+            cmd_below_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type.clone(),
+                    table: command.sql_cmd.table.clone(),
+                    columns: command.sql_cmd.columns.clone(),
+                    values: Some(below_10.clone()),
+                    keys: Some(Vec::new()),
+                    consistency: command.sql_cmd.consistency.clone(),
+                },
+                phase: Some(Phase::Prepare),
+            };
+            number_of_involed_shards += 1;
+        }
+        if !above_10.is_empty() {
+            // cmd_above_10.sql_cmd.values = Some(above_10);
+            cmd_above_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type.clone(),
+                    table: command.sql_cmd.table.clone(),
+                    columns: command.sql_cmd.columns.clone(),
+                    values: Some(above_10.clone()),
+                    keys: Some(Vec::new()),
+                    consistency: command.sql_cmd.consistency.clone(),
+                },
+                phase: Some(Phase::Prepare),
+            };
+            number_of_involed_shards += 1;
+        }
+
+        // info!("{}: above vector is: {:?}", self.id, cmd_above_10.sql_cmd.values);
+        // info!("{}: below vector is: {:?}", self.id, cmd_below_10.sql_cmd.values);
+        (number_of_involed_shards, cmd_below_10, cmd_above_10)
     }
 
     // Sends outgoing messages from the primary omnipaxos instance using the standard cluster channel
@@ -486,9 +639,9 @@ impl OmniPaxosServer {
 
         for (cmd_id, client_id, responses, _) in valid_read_results {
             info!("{}: Received read responses: {:?}", self.id, responses);
-            // let response_str = responses.join(", ");
-            // let msg = ServerMessage::Answer(cmd_id, Some(response_str));
-            // self.network.lock().await.send_to_client(client_id, msg);
+            let response_str = responses.join(", ");
+            let msg = ServerMessage::Answer(cmd_id, Some(response_str));
+            self.network.lock().await.send_to_client(client_id, msg);
         }
 
         self.pending_read_results

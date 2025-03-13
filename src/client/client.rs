@@ -132,7 +132,7 @@ impl Client {
         let key = self.next_request_id.to_string();
         let cmd = match query_type {
             QueryType::Create => SqlCommand::create_table_cmd(),
-            QueryType::Insert => SqlCommand::insert_cmd(self.id.to_string() , key),
+            QueryType::Insert => SqlCommand::insert_cmd(self.id.to_string() , keys),
             // It's not very interesting to select a key that doesn't exist, so we'll just select the previous key.
             // TODO use different consistency levels for reads.
             _ => SqlCommand::select_cmd(keys, Consistency::Leader),

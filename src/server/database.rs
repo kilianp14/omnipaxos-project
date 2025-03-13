@@ -86,8 +86,9 @@ impl Database {
 
 
         let rows: Option<Vec<(String,)>> = query_as(&query_str).fetch_all(&self.pool).await.ok();
-        info!("Query: {}", query_str);
-        info!("Rows: {:?}", rows);
+        
+        // info!("Query: {}", query_str);
+        // info!("Rows: {:?}", rows);
 
         match rows {
             Some(values) => {
@@ -103,16 +104,16 @@ impl Database {
     }
 
     async fn handle_insert(&self, command: SqlCommand, id:CommandId) -> Option<String> {
-        let columns = command
+        let columns = command.clone()
             .columns
             .into_iter()
             .map(|(col, _)| col)
             .collect::<Vec<String>>()
             .join(", ");
-        let values: String = command
+        let values: String = command.clone()
             .values?
             .iter()
-            .map(|i| format!("'{}'", i))
+            .map(|i| format!("{}", i))
             .collect::<Vec<String>>()
             .join(", ");
 
@@ -120,9 +121,16 @@ impl Database {
         let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
 
         // Execute your insert.
-        let insert_query = format!("INSERT INTO {} ({}) VALUES ({})", command.table, columns, values);
-        let result: Option<PgQueryResult> = query(&insert_query).execute(&self.pool).await.ok();
-
+        for value in command.values.unwrap_or_default() {
+            let insert_query = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                command.table, columns, value
+            );
+            let result: Option<PgQueryResult> = query(&insert_query).execute(&self.pool).await.ok();
+            if result.is_none() {
+                return Some(format!("Failed to insert row with query {}", insert_query));
+            }
+        }
         // Prepare the transaction to make it pending.
         let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
         let result: Option<PgQueryResult> = query(&prepare_query).execute(&self.pool).await.ok();
