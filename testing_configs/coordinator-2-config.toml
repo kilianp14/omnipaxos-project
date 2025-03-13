@@ -1,6 +1,9 @@
 location = "local-2"
 server_id = 2
+shard_id = 0
 num_clients = 0 # Hardcoded number of client connections to wait for
 listen_address = "127.0.0.1"
 listen_port = 10002
-output_filepath = "./testing_configs/logs/server-2.json"
+shards = [1, 2]
+shard_addrs = ["127.0.0.1:10005", "127.0.0.1:10008"]
+output_filepath = "./testing_configs/logs/coordinator-2.json"

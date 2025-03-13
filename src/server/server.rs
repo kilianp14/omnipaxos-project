@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosSqlConfig, database::Database, network::NetworkTrait};
+use crate::{lib::OmniPaxosSqlConfig, database::Database, network::NetworkTrait};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -63,7 +63,7 @@ impl OmniPaxosServer {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
                     match self.omnipaxos.get_current_leader() {
-                        Some(leader) => info!("{}: Current Leader: {}, QC: {}", self.id, leader.0, leader.1),
+                        Some(leader) => debug!("{}: Current Leader: {}, QC: {}", self.id, leader.0, leader.1),
                         None => {}
                     }
                     self.send_outgoing_msgs();

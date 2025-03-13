@@ -3,4 +3,6 @@ server_id = 1
 num_clients = 0 # Hardcoded number of client connections to wait for
 listen_address = "127.0.0.1"
 listen_port = 10001
-output_filepath = "./testing_configs/logs/server-1.json"
+shards = [1, 2]
+shard_addrs = ["127.0.0.1:10004", "127.0.0.1:10007"]
+output_filepath = "./testing_configs/logs/coordinator-1.json"

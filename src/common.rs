@@ -1,6 +1,9 @@
+
+
 pub mod messages {
     use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
     use serde::{Deserialize, Serialize};
+    use crate::common::sql::ClientId;
 
     use super::{
         sql::{Command, CommandId, SqlCommand},
@@ -11,14 +14,15 @@ pub mod messages {
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
         ClientRegister,
+        CoordinatorRegister,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
-        ReadRequest(NodeId, NodeId, CommandId, SqlCommand),
-        ReadResponse(NodeId, CommandId, Option<String>),
+        ReadRequest(ClientId, NodeId, CommandId, SqlCommand),
+        ReadResponse(ClientId, CommandId, Option<String>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +34,20 @@ pub mod messages {
     pub enum ServerMessage {
         Answer(CommandId, Option<String>),
         StartSignal(Timestamp),
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum CoordinatorMessage {
+        Prepare(CommandId, SqlCommand),
+        Commit(CommandId),
+        Abort(CommandId),
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum ShardMessage {
+        Ack(ClientId, CommandId),
+        Nack(ClientId, CommandId),
+        Answer(ClientId, CommandId, Option<String>),
     }
 
     impl ServerMessage {
@@ -51,6 +69,7 @@ pub mod sql {
 
     pub type CommandId = usize;
     pub type ClientId = u64;
+    pub type ShardId = u64;
     pub type NodeId = omnipaxos::util::NodeId;
     pub type InstanceId = NodeId;
 
@@ -60,6 +79,14 @@ pub mod sql {
         pub coordinator_id: NodeId,
         pub id: CommandId,
         pub sql_cmd: SqlCommand,
+        pub phase: Phase,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum Phase {
+        Prepare,
+        Commit,
+        Abort,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,8 +94,8 @@ pub mod sql {
         pub query_type: QueryType,
         pub table: String,
         pub columns: Vec<(String, String)>, // this is column name, type
+        pub keys: Option<Vec<String>>,
         pub values: Option<Vec<String>>,
-        pub conditions: Option<String>,
         pub consistency: Option<Consistency>,
     }
 
@@ -82,12 +109,12 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
+                keys: None,
                 values: None,
-                conditions: None,
                 consistency: None,
             }
         }
-        pub fn insert_cmd(key: String, value: String) -> Self {
+        pub fn insert_cmd(keys: Vec<String>, values: Vec<String>) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
@@ -95,19 +122,19 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
-                values: Some(vec![key.clone(), value.clone()]),
-                conditions: None,
+                keys: Some(keys),
+                values: Some(values),
                 consistency: None,
             }
         }
 
-        pub fn select_cmd(key: String, consistency: Consistency) -> Self {
+        pub fn select_cmd(keys: Vec<String>, consistency: Consistency) -> Self {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
                 columns: vec![("value".to_string(), "text".to_string())],
+                keys: Some(keys),
                 values: None,
-                conditions: Some(format!("key = '{}'", key)),
                 consistency: Some(consistency),
             }
         }
@@ -117,8 +144,6 @@ pub mod sql {
     pub enum QueryType {
         Select,
         Insert,
-        Update,
-        Delete,
         Create,
     }
 
@@ -157,6 +182,7 @@ pub mod utils {
         (),
         Bincode<ClusterMessage, ()>,
     >;
+
     pub type ToNodeConnection = Framed<
         FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
         (),
@@ -173,13 +199,6 @@ pub mod utils {
             ToNodeConnection::new(sink, Bincode::default()),
         )
     }
-
-    // pub type ServerConnection = Framed<
-    //     CodecFramed<TcpStream, LengthDelimitedCodec>,
-    //     ServerMessage,
-    //     ClientMessage,
-    //     Bincode<ServerMessage, ClientMessage>,
-    // >;
 
     pub type FromServerConnection = Framed<
         FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
@@ -221,11 +240,6 @@ pub mod utils {
         )
     }
 
-    // pub fn frame_clients_connection(stream: TcpStream) -> ServerConnection {
-    //     let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
-    //     Framed::new(length_delimited, Bincode::default())
-    // }
-
     pub fn frame_servers_connection(
         stream: TcpStream,
     ) -> (FromClientConnection, ToClientConnection) {
@@ -235,6 +249,58 @@ pub mod utils {
         (
             FromClientConnection::new(stream, Bincode::default()),
             ToClientConnection::new(sink, Bincode::default()),
+        )
+    }
+
+    pub type FromCoordinatorConnection = Framed<
+        FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+        CoordinatorMessage,
+        (),
+        Bincode<CoordinatorMessage, ()>,
+    >;
+
+    pub type ToCoordinatorConnection = Framed<
+        FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+        (),
+        ShardMessage,
+        Bincode<(), ShardMessage>,
+    >;
+
+    pub type FromShardConnection = Framed<
+        FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+        ShardMessage,
+        (),
+        Bincode<ShardMessage, ()>,
+    >;
+
+    pub type ToShardConnection = Framed<
+        FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+        (),
+        CoordinatorMessage,
+        Bincode<(), CoordinatorMessage>,
+    >;
+
+    pub fn frame_shard_connection(
+        stream: TcpStream,
+    ) -> (FromCoordinatorConnection, ToCoordinatorConnection) {
+        let (reader, writer) = stream.into_split();
+        let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+        let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+        (
+            FromCoordinatorConnection::new(stream, Bincode::default()),
+            ToCoordinatorConnection::new(sink, Bincode::default()),
+        )
+    }
+
+    pub fn frame_coordinator_connection(
+        stream: TcpStream,
+    ) -> (FromShardConnection, ToShardConnection) {
+        let (reader, writer) = stream.into_split();
+        let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+        let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+        (
+            FromShardConnection::new(stream, Bincode::default()),
+            ToShardConnection::new(sink, Bincode::default()),
         )
     }
 }

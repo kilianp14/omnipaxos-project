@@ -1,0 +1,5 @@
+cluster_name = "shard2-cluster"
+nodes = [1, 2, 3]
+node_addrs = ["127.0.0.1:10007", "127.0.0.1:10008", "127.0.0.1:10009"]
+initial_leader = 3
+initial_flexible_quorum = { read_quorum_size = 2, write_quorum_size = 2 }

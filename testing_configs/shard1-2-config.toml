@@ -1,0 +1,6 @@
+location = "local-5"
+server_id = 1
+shard_id = 1
+listen_address = "127.0.0.1"
+listen_port = 10005
+output_filepath = "./testing_configs/logs/shard1-2.json"

@@ -1,4 +1,4 @@
-cluster_name = "local-cluster"
+cluster_name = "coordinator-cluster"
 nodes = [1, 2, 3]
 node_addrs = ["127.0.0.1:10001", "127.0.0.1:10002", "127.0.0.1:10003"]
 initial_leader = 3

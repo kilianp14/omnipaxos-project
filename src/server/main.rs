@@ -1,11 +1,9 @@
-use crate::{configs::OmniPaxosSqlConfig, database::Database, server::OmniPaxosServer, network::Network, network_test::TestNetwork};
+use crate::{lib::OmniPaxosSqlConfig, database::Database, server::OmniPaxosServer, network::Network, network_test::TestNetwork};
 use log::*;
 use env_logger;
 use network::NetworkTrait;
 use std::sync::Arc;
 
-mod configs;
-mod database;
 mod network;
 mod server;
 mod network_test;
