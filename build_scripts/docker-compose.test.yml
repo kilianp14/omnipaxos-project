@@ -1,0 +1,64 @@
+x-common-variables: &common-server-variables
+  RUST_LOG: "debug"
+  SERVER_CONFIG_FILE: "/app/server-config.toml"
+  CLUSTER_CONFIG_FILE: "/app/cluster-config.toml"
+  OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000" # Overwrite node_addrs in cluster config TOML
+  OMNIPAXOS_LISTEN_ADDRESS: "0.0.0.0"             # Overwrite listen_address in server config TOMLs
+  OMNIPAXOS_LISTEN_PORT: 8000                     # Overwrite listen_port in server config TOMLs
+
+services:
+  s1:
+    image: omnipaxos-server
+    build:
+      context: ./..
+      dockerfile: server.dockerfile
+    container_name: s1
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./server-1-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  s2:
+    image: omnipaxos-server
+    container_name: s2
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./server-2-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  s3:
+    image: omnipaxos-server
+    container_name: s3
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./server-3-config.toml:/app/server-config.toml
+      - ./cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  c1:
+    image: test-coordinator
+    build:
+      context: ./..
+      dockerfile: coordinator.dockerfile
+    container_name: coo
+    networks:
+      - backend
+    environment:
+      RUST_LOG: "debug"
+      CONFIG_FILE: "/app/coordinator-config.toml"
+      OMNIPAXOS_SERVER_ADDRESS: "s1:8001,s2:8002,s3:8003"
+    volumes:
+      - ./coordinator-config.toml:/app/coordinator-config.toml
+      - ./logs/:/app/logs/
+
+networks:
+  backend:
+    driver: bridge
