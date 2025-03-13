@@ -10,6 +10,8 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
+        NodeRegister2(NodeId),
+        NodeRegister3(NodeId),
         ClientRegister,
     }
 
@@ -18,7 +20,7 @@ pub mod messages {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
         ReadRequest(NodeId, NodeId, CommandId, SqlCommand),
-        ReadResponse(NodeId, CommandId, Option<String>),
+        ReadResponse(NodeId, NodeId, CommandId, Option<String>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +62,14 @@ pub mod sql {
         pub coordinator_id: NodeId,
         pub id: CommandId,
         pub sql_cmd: SqlCommand,
+        pub phase: Option<Phase>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum Phase {
+        Prepare,
+        Commit,
+        Abort,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +78,7 @@ pub mod sql {
         pub table: String,
         pub columns: Vec<(String, String)>, // this is column name, type
         pub values: Option<Vec<String>>,
-        pub conditions: Option<String>,
+        pub keys: Option<Vec<String>>,
         pub consistency: Option<Consistency>,
     }
 
@@ -83,11 +93,11 @@ pub mod sql {
                     ("value".to_string(), "text".to_string()),
                 ],
                 values: None,
-                conditions: None,
+                keys: None,
                 consistency: None,
             }
         }
-        pub fn insert_cmd(key: String, value: String) -> Self {
+        pub fn insert_cmd(client_id: String, keys: Vec<String>) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
@@ -95,19 +105,19 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
-                values: Some(vec![key.clone(), value.clone()]),
-                conditions: None,
+                values: Some(keys.into_iter().map(|key| format!("('{}', '{}_value_{}')", key,client_id,key)).collect()),
+                keys: None,
                 consistency: None,
             }
         }
 
-        pub fn select_cmd(key: String, consistency: Consistency) -> Self {
+        pub fn select_cmd(keys: Vec<String>, consistency: Consistency) -> Self {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
                 columns: vec![("value".to_string(), "text".to_string())],
                 values: None,
-                conditions: Some(format!("key = '{}'", key)),
+                keys: Some(keys),
                 consistency: Some(consistency),
             }
         }
@@ -128,6 +138,53 @@ pub mod sql {
         Local,
         Linearizable,
     }
+
+    //#[derive(Clone, Debug, Serialize, Deserialize)]
+    //pub struct KVSnapshot {
+    //snapshotted: HashMap<String, String>,
+    //deleted_keys: Vec<String>,
+    //}
+
+    //impl Snapshot<Command> for KVSnapshot {
+    //fn create(entries: &[Command]) -> Self {
+    //let mut snapshotted = HashMap::new();
+    //let mut deleted_keys: Vec<String> = Vec::new();
+    //for e in entries {
+    //match &e.kv_cmd {
+    //KVCommand::Put(key, value) => {
+    //snapshotted.insert(key.clone(), value.clone());
+    //}
+    //KVCommand::Delete(key) => {
+    //if snapshotted.remove(key).is_none() {
+    //// key was not in the snapshot
+    //deleted_keys.push(key.clone());
+    //}
+    //}
+    //KVCommand::Get(_) => (),
+    //}
+    //}
+    //// remove keys that were put back
+    //deleted_keys.retain(|k| !snapshotted.contains_key(k));
+    //Self {
+    //snapshotted,
+    //deleted_keys,
+    //}
+    //}
+
+    //fn merge(&mut self, delta: Self) {
+    //for (k, v) in delta.snapshotted {
+    //self.snapshotted.insert(k, v);
+    //}
+    //for k in delta.deleted_keys {
+    //self.snapshotted.remove(&k);
+    //}
+    //self.deleted_keys.clear();
+    //}
+
+    //fn use_snapshots() -> bool {
+    //true
+    //}
+    //}
 }
 
 pub mod utils {
