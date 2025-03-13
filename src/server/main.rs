@@ -41,8 +41,6 @@ pub async fn main() {
     let mut shard2 = Shard::new(server_config.clone(), database2, network.clone(), mediator.clone(),2).await;
     let mut server = OmniPaxosServer::new(server_config.clone(), network.clone(),mediator).await;
 
-    // server.run().await;
-
     let server_task = tokio::spawn(async move {
         server.run(rx_server).await;
     });

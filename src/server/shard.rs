@@ -92,23 +92,6 @@ impl Shard {
                 } => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
                 },
-                // _ = async {
-                //     if let Some(callback) = &self.callback {
-                //         callback.read_cluster_msgs(&mut cluster2_msg_buf).await;
-                //     }
-                //     // self.network.cluster2_messages.recv_many(&mut cluster2_msg_buf, NETWORK_BATCH_SIZE).await
-                // } => {
-                   
-                //     self.handle_cluster2_messages(&mut cluster2_msg_buf).await;
-                // },
-                // _ = async {
-                //     self.network.client_messages.recv_many(&mut client_msg_buf, NETWORK_BATCH_SIZE).await
-                // } => {
-                //     self.handle_client_messages(&mut client_msg_buf).await;
-                // },
-                // _ = shardTimeoutInterval.tick() => {
-                //     self.check_pending_transactions().await;
-                // }
                 _ = mpscTimeoutInterval.tick() => {
                     let mut messages = Vec::new();
                     while let Ok(message) = rx.try_recv() {
@@ -144,7 +127,6 @@ impl Shard {
                             info!("{}: Leader shard fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start).await;
-                            // self.send_client_start_signals(experiment_sync_start).await;
                             break;
                         }
                     }
@@ -158,25 +140,12 @@ impl Shard {
                     } else {
                         self.network.lock().await.cluster3_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE).await
                     }
-                    // let mut network = self.network.lock().await;
-                    // network.cluster2_messages.recv_many(cluster2_msg_buffer, NETWORK_BATCH_SIZE).await
                 } => {
                     let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
                     if recv_start {
                         break;
                     }
                 },
-                // _ = async {
-                //     if let Some(callback) = &self.callback {
-                //         callback.read_cluster_msgs(cluster2_msg_buffer).await;
-                //     }
-                //     // self.network.cluster2_messages.recv_many(cluster2_msg_buffer, NETWORK_BATCH_SIZE).await
-                // } => {
-                //     let recv_start = self.handle_cluster2_messages(cluster2_msg_buffer).await;
-                //     if recv_start {
-                //         break;
-                //     }
-                // },
             }
         }
     }
@@ -209,7 +178,7 @@ impl Shard {
                     }
                 }
                 ClusterMessage::ReadResponse(client_id, coord_id, command_id, response) => {
-                    // will be always the shard that also send the cluster so we can jsut return result to our own coordinator
+                    // will be always the shard that also send the cluster so we can just return result to our own coordinator
                     // This is due to the fact that a ReadRequest responds with the result to the shard first, who then forwards it to its own coordaintor, who also sent the query originally. We could skip this step over the intermediate shard, but this is also fine. (one more message)
                     let msg = ClusterMessage::ReadResponse(client_id, coord_id, command_id, response);
                     info!("{} sending from shard {} to {}", self.id, self.id, coord_id);
@@ -260,7 +229,7 @@ impl Shard {
                         Some(Phase::Prepare) => {
                             match command.sql_cmd.query_type {
                                 QueryType::Select => {
-                                    // TODO: this is teh only case where the read result is not coming from the same shard process as the coordinator send it
+                                    // TODO: this is the only case where the read result is not coming from the same shard process as the coordinator send it from. This is the read that is with Lineraizable consistency and was therefore decided by omnipaxos.
                                     let msg = ClusterMessage::ReadResponse(command.client_id, command.coordinator_id, command.id, response);
                                     let mut network = self.network.lock().await;
                                     info!("{} sending from shard {} to {}", self.id, self.id,command.coordinator_id);
@@ -330,9 +299,11 @@ impl Shard {
     }
 
 
+    // confusing name, but this is the function that the coordinator of this proccess cals to send a propose to the shard
     pub async fn send_prepare_to_shard(&mut self, command: Command) {
         let sql_cmd = command.sql_cmd.clone();
         match sql_cmd.query_type {
+            // selects are not decided on the shard level and the result is just send back.
             QueryType::Select => {
                 self.handle_read_message(command.client_id, command.coordinator_id, command.id, sql_cmd).await;
             }
@@ -343,6 +314,7 @@ impl Shard {
         self.send_outgoing_msgs().await;
     }
 
+    // to send a commit and abort transaction once the prepare is already acked. This doesnt ened to have the omnipaxos stuff. We are using update_database_and_respond in two ways: 1. here just to update the databse and 2. to react to omnipaxos decide msg. these usecases are distinguished by the is_decided boolean.
     pub async fn commit_or_abort_on_shard(&mut self, command: Command) {
         // is decided is false here as this value is imposed by the coordiantor. aggrement is ensured as this was already proposed earlier in the 2pc protocoll. the is_decide boolean contolls wether to respond to the coordinaot with te result. which we only need if the value was freshly decided by omnipaxos (we did a Linearizable Read)
         self.update_database_and_respond(vec![command], false).await;
@@ -415,11 +387,10 @@ impl Shard {
                     Err(e) => {
                         // TODO: implement this special case to respond to the coordinator with a special abort message, that removes this transaction from the pending transactions vector and sends abort to client
 
+                        // somethings one the lines of this but this left over from somwhere else
                         // let response = format!("Failed to achieve linearizable read: {:?}", e);
                         // let msg = ClusterMessage::ReadResponse(client_id, coordinator_id, command_id, Some(response));
-                        // // let mut network = self.network.lock().await;
                         // info!("{} sending from shard {} to {}", self.id, self.id,coordinator_id);
-                        // // network.send_to_cluster(coordinator_id, msg);        // send back to the coorinator the request came from
                         // self.mediator.response_from_shard(msg);
                     }
                 }

@@ -27,6 +27,7 @@ pub enum MediatorMessage {
     ResponseFromShard(ClusterMessage),
 }
 
+//  Mediator struct where both the server and the shard have access to. Uses async message passing to communicate between the server and the shards. Each on gets the receive end of the message pip and does some active polling on it in the main loop. (intervall is 100ms and could be set to even less to make them more responsive.)
 #[derive(Clone)]
 pub struct Mediator {
     shard1_tx: Sender<MediatorMessage>,
@@ -313,11 +314,12 @@ impl OmniPaxosServer {
                         }
                     }
                     info!("{}: push command {} to pending", self.id, command.id);
-                    info!("{}: pending_transactions {:?}", self.id, self.pending_transactions);
-                    info!("{}: pending_read_results {:?}", self.id, self.pending_read_results);
+                    info!("{}: pending_transactions {:?}", self.id, self.pending_transactions);      // this vector is for keeping track of which shards yet have to ack a transaction (they do as soon as all proccessed the command) in their RSM decided on that value)
+                    info!("{}: pending_read_results {:?}", self.id, self.pending_read_results);     // this vector is for keeping track of the read results comming from the shards. The coordinator has to merge them and send them back to the client.
                 }
             } else {
-                match command.phase {
+                // After the prepare was succesfull and every shard acked the prepare, we can then commit (or abort if at least one didnt ack in specified timeout).
+                match command.phase {       
                     Some(Phase::Commit) => {
                         info!("{}: Committing command {}", self.id, command.id);
                     }
@@ -538,7 +540,8 @@ impl OmniPaxosServer {
         }
     }
 
-    // For each shard we append the command.id to the vec. The ack removes it again.
+    // For each shard thatis involved in the transaction, the coordinator has to keep track of the acks. If all shards acked the transaction, the coordinator can commit the transaction.
+    // this function is the receiver of the shards sending the ack acks as it marks one of the boolean as true for each ack we got. We can then actively poll the pending_transactions vector for transactions that are ready to be commited (all booleans are true).
     pub fn ack_from_shard(&mut self, command_id: CommandId) {
         // Find the transaction with the given command_id
         if let Some(transaction) = self.pending_transactions.iter_mut()
@@ -556,6 +559,7 @@ impl OmniPaxosServer {
 
     }
 
+    // same as for the ack, but for receiving the responses.
     pub fn process_response_from_shard(&mut self, msg:ClusterMessage) {
         if let ClusterMessage::ReadResponse(client_id, _, command_id, response) = msg {
             if let Some((_, _, responses, _)) = self.pending_read_results.iter_mut().find(|(id, cli_id, _, _)| *id == command_id && *cli_id == client_id) {
@@ -564,6 +568,7 @@ impl OmniPaxosServer {
         }
     }
 
+    // function that implements the active pooling for completed prepare messages everyone acked or completed read transactions where every involved shard returned their response
     async fn check_pending_transactions(&mut self) {
         let dummy_sql_command = SqlCommand {
             query_type: QueryType::Insert,
