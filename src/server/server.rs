@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosSqlConfig, database::Database, network::NetworkTrait};
+use crate::{configs::OmniPaxosSqlConfig,  database::Database, network::{self, Network, NetworkTrait}};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -8,56 +8,126 @@ use omnipaxos::{
 };
 use omnipaxos_sql::common::{messages::*, sql::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
+use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::Arc;
 use std::{fs::File, io::Write, time::Duration};
+
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const SHARD_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Clone)]
+pub enum MediatorMessage {
+    AckFromShard(usize),
+    PrepareFromServer(Command),
+    CommitOrAbortFromServer(Command),
+    ResponseFromShard(ClusterMessage),
+}
+
+//  Mediator struct where both the server and the shard have access to. Uses async message passing to communicate between the server and the shards. Each on gets the receive end of the message pip and does some active polling on it in the main loop. (intervall is 100ms and could be set to even less to make them more responsive.)
+#[derive(Clone)]
+pub struct Mediator {
+    shard1_tx: Sender<MediatorMessage>,
+    shard2_tx: Sender<MediatorMessage>,
+    server_tx: Sender<MediatorMessage>,
+}
+
+impl Mediator {
+    pub fn new(shard1_tx: Sender<MediatorMessage>, shard2_tx: Sender<MediatorMessage>, server_tx: Sender<MediatorMessage>) -> Self {
+        Self { shard1_tx, shard2_tx, server_tx }
+    }
+
+    // Dispatch functions
+    fn send_prepare_to_shard1(&self,  cmd: Command) {
+        let _ = self.shard1_tx.send(MediatorMessage::PrepareFromServer(cmd));
+    }
+
+    fn commit_or_abort_on_shard1(&self,  cmd: Command) {
+        let _ = self.shard1_tx.send(MediatorMessage::CommitOrAbortFromServer(cmd));
+    }
+
+    fn send_prepare_to_shard2(&self,  cmd: Command) {
+        let _ = self.shard2_tx.send(MediatorMessage::PrepareFromServer(cmd));
+    }
+
+    fn commit_or_abort_on_shard2(&self,  cmd: Command) {
+        let _ = self.shard2_tx.send(MediatorMessage::CommitOrAbortFromServer(cmd));
+    }
+
+    pub fn ack_from_shard(&self,  cmd_id: usize) {
+        let _ = self.server_tx.send(MediatorMessage::AckFromShard(cmd_id));
+    }
+
+    pub fn response_from_shard(&self, response:ClusterMessage) {
+        let _ = self.server_tx.send(MediatorMessage::ResponseFromShard(response));
+    }
+}
 
 pub struct OmniPaxosServer {
     id: NodeId,
+    network: Arc<tokio::sync::Mutex<Network>>,
+    // shard1: Shard,
+    // database: Arc<Database>,
     database: Arc<Database>,
-    network: Box<dyn NetworkTrait>,
+    // TODO: merge
+    // network: Box<dyn NetworkTrait>,
     omnipaxos: OmniPaxosInstance,
-    current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
+    // New second omnipaxos instance and its message buffer
+    // omnipaxos2: OmniPaxosInstance,
+    // omnipaxos_msg_buffer2: Vec<Message<Command>>,
+    current_decided_idx: usize,
+    // current_decided_shard_idx: usize,
     config: OmniPaxosSqlConfig,
     peers: Vec<NodeId>,
+    pending_transactions: Vec<(Timestamp, CommandId, ClientId, Vec<bool>)>,
+    pending_read_results: Vec<(CommandId, ClientId, Vec<String>,i32)>,
+    mediator: Mediator,
 }
 
 impl OmniPaxosServer {
+    // pub async fn new(config: OmniPaxosSqlConfig, network: Arc<tokio::sync::Mutex<Network>>, mediator:Mediator) -> Self {
     pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>, network: Box<dyn NetworkTrait>) -> Self {
-        // Initialize OmniPaxos instance
+        // Initialize first OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
+
+        let pending_transactions = Vec::new();
+        let pending_read_results = Vec::new();
         // Waits for client and server network connections to be established
         OmniPaxosServer {
             id: config.local.server_id,
-            database,
             network,
             omnipaxos,
-            current_decided_idx: 0,
             omnipaxos_msg_buffer,
+            current_decided_idx: 0,
             peers: config.get_peers(config.local.server_id),
             config,
+            pending_transactions,
+            pending_read_results,
+            mediator,
         }
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, rx: Receiver<MediatorMessage>) {
         // Save config to output file
         self.save_output().expect("Failed to write to file");
+
         let mut client_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         // We don't use Omnipaxos leader election at first and instead force a specific initial leader
-        self.establish_initial_leader(&mut cluster_msg_buf, &mut client_msg_buf)
-            .await;
+        self.establish_initial_leader(&mut cluster_msg_buf, &mut client_msg_buf).await;
         info!{"{}: Initial election phase over", self.id};
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
+        let mut shardTimeoutInterval = tokio::time::interval(SHARD_TIMEOUT);
+        let mut mpscTimeoutInterval = tokio::time::interval(SHARD_TIMEOUT);
+
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
@@ -66,16 +136,43 @@ impl OmniPaxosServer {
                         Some(leader) => info!("{}: Current Leader: {}, QC: {}", self.id, leader.0, leader.1),
                         None => {}
                     }
-                    self.send_outgoing_msgs();
+                    self.send_outgoing_msgs().await;
                 },
-                _ = self.network.recv_many(&mut cluster_msg_buf, &mut client_msg_buf, NETWORK_BATCH_SIZE) => {
+                _ = async {
+                    let mut net = self.network.lock().await;
+                    net.recv_many(&mut cluster_msg_buf, &mut client_msg_buf, NETWORK_BATCH_SIZE).await
+                } => {
                     if !cluster_msg_buf.is_empty() {
                         self.handle_cluster_messages(&mut cluster_msg_buf).await;
                     }
                     if !client_msg_buf.is_empty() {
                         self.handle_client_messages(&mut client_msg_buf).await;
                     }
+                // TODO: merge
+                // _ = self.network.recv_many(&mut cluster_msg_buf, &mut client_msg_buf, NETWORK_BATCH_SIZE) => {
+                //     if !cluster_msg_buf.is_empty() {
+                //         self.handle_cluster_messages(&mut cluster_msg_buf).await;
+                //     }
+                //     if !client_msg_buf.is_empty() {
+                //         self.handle_client_messages(&mut client_msg_buf).await;
+                //     }
                 },
+                _ = shardTimeoutInterval.tick() => {
+                    self.check_pending_transactions().await;
+                },
+                _ = mpscTimeoutInterval.tick() => {
+                    let mut messages = Vec::new();
+                    while let Ok(message) = rx.try_recv() {
+                        messages.push(message);
+                    }
+                    for message in messages {
+                        if let MediatorMessage::AckFromShard(command_id) = message {
+                            self.ack_from_shard(command_id);
+                        } else if let MediatorMessage::ResponseFromShard(msg) = message {
+                            self.process_response_from_shard(msg);
+                        }
+                    }
+                }
             }
         }
     }
@@ -89,23 +186,30 @@ impl OmniPaxosServer {
         client_msg_buffer: &mut Vec<(ClientId, ClientMessage)>,
     ) {
         let mut leader_takeover_interval = tokio::time::interval(LEADER_WAIT);
+        // let mut leader_takeover_interval2 = tokio::time::interval(LEADER_WAIT);
         loop {
             tokio::select! {
                 _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
                     if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
                         if curr_leader == self.id && is_accept_phase {
-                            info!("{}: Leader fully initialized", self.id);
+                            info!("{}: Leader coodinator fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
-                            self.send_cluster_start_signals(experiment_sync_start);
+                            self.send_cluster_start_signals(experiment_sync_start).await;
                             self.send_client_start_signals(experiment_sync_start).await;
                             break;
                         }
                     }
-                    info!("{}: Attempting to take leadership", self.id);
+                    info!("{}: Attempting to take leadership for coordinator", self.id);
                     self.omnipaxos.try_become_leader();
-                    self.send_outgoing_msgs();
+                    self.send_outgoing_msgs().await;
                 },
-                _ = self.network.recv_many(cluster_msg_buffer, client_msg_buffer, NETWORK_BATCH_SIZE) => {
+                // TODO: merge
+                // _ = self.network.recv_many(cluster_msg_buffer, client_msg_buffer, NETWORK_BATCH_SIZE) => {
+                //     if !cluster_msg_buffer.is_empty() {
+                _ = async {
+                    let mut net = self.network.lock().await;
+                    net.recv_many(cluster_msg_buffer, client_msg_buffer, NETWORK_BATCH_SIZE).await
+                } => {
                     if !cluster_msg_buffer.is_empty() {
                         let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
                         if recv_start {
@@ -120,9 +224,55 @@ impl OmniPaxosServer {
         }
     }
 
+    async fn handle_cluster_messages(
+        &mut self,
+        messages: &mut Vec<(NodeId, ClusterMessage)>,
+    ) -> bool {
+        let mut received_start_signal = false;
+        for (from, message) in messages.drain(..) {
+            trace!("{}: Received {message:?} for {}", self.id, 0);
+            match message {
+            ClusterMessage::OmniPaxosMessage(m) => {
+                self.omnipaxos.handle_incoming(m);
+                self.handle_decided_entries().await;
+            }
+            ClusterMessage::LeaderStartSignal(start_time) => {
+                debug!("Received start message from peer {from}");
+                received_start_signal = true;
+                self.send_client_start_signals(start_time).await;
+            }
+            ClusterMessage::ReadResponse(client_id, coordinator_id, command_id, response) => {      // this is guaranted to be a response comming from a shard that is the result of a read query. The coordinstor doesnt use ReadResponse messages otherwise.
+                info!("{}: Received read response from shard for command {}", self.id, command_id);
+                if let Some((_, _, responses, _)) = self.pending_read_results.iter_mut().find(|(id, _,  _, _)| *id == command_id) {
+                    responses.push(response.unwrap_or_default());
+                }
+            }
+            other => {
+                debug!(
+                "{}: !!! RECEIVED UNHANDLED CLUSTER MESSAGE: {:?}",
+                self.id, other
+                );
+            }
+            }
+        }
+        self.send_outgoing_msgs().await;
+        received_start_signal
+    }
+
+    async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
+        for (from, message) in messages.drain(..) {
+            info!("{}: Received {message:?} from client {from}", self.id);
+            match message {
+                ClientMessage::Handle(command_id, sql_command) => match sql_command.query_type {
+                    _ => self.append_to_log(from, command_id, sql_command),
+                },
+            }
+        }
+        self.send_outgoing_msgs().await;
+    }
+
     async fn handle_decided_entries(&mut self) {
-        // TODO: Can use a read_raw here to avoid allocation
-        let new_decided_idx = self.omnipaxos.get_decided_idx();
+        let new_decided_idx: usize = self.omnipaxos.get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
             let decided_entries = self
                 .omnipaxos
@@ -136,30 +286,246 @@ impl OmniPaxosServer {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands).await;
+            self.process_decided_entries(decided_commands).await;
         }
     }
 
-    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
-        // TODO: batching responses possible here (batch at handle_cluster_messages)
-        // This todo was already in the repo, dont think we actually need to do batching
-        // For now lets just do write-through
-        for command in commands {
-            let response = self.database.handle_command(command.sql_cmd).await;
-            if command.coordinator_id == self.id {
-                let msg = ServerMessage::Answer(command.id, response);
-                self.network.send_to_client(command.client_id, msg);
+    async fn process_decided_entries(&mut self, commands: Vec<Command>) {
+        for mut command in commands {
+            if matches!(command.phase, Some(Phase::Prepare)) || command.phase.is_none() {
+                if command.coordinator_id == self.id {
+                    if matches!(command.sql_cmd.query_type, QueryType::Create){
+                        self.pending_transactions.push((Utc::now().timestamp_millis(), command.id, command.client_id, vec![false]));
+                        command.phase = Some(Phase::Prepare);
+                        // create table has to be executed on every table and on every shard
+                        self.mediator.send_prepare_to_shard1(command.clone());
+                        self.mediator.send_prepare_to_shard2(command.clone());
+                    }
+                    if matches!(command.sql_cmd.query_type, QueryType::Insert){
+                        let (number_of_involed_shards, mut cmd_below_10, mut cmd_above_10) = self.split_insert_command(command.clone());
+                        self.pending_transactions.push((Utc::now().timestamp_millis(), command.id, command.client_id, vec![false; number_of_involed_shards as usize]));
+                        self.mediator.send_prepare_to_shard1(cmd_below_10.clone());
+                        self.mediator.send_prepare_to_shard2(cmd_above_10.clone());
+                    }
+                    if matches!(command.sql_cmd.query_type, QueryType::Select){
+                        let (number_of_involed_shards, mut cmd_below_10, mut cmd_above_10) = self.split_select_command(command.clone());
+                        // select tranactions are appended to the vector in order to keep track which shards already send the result back
+                        self.pending_read_results.push((command.id, command.client_id, vec![], number_of_involed_shards as i32));     // this is for collecting the read results
+
+                        match command.sql_cmd.consistency {
+                            Some(Consistency::Linearizable) => {
+                                // linearizable read get decided so they can abort. whe need to keep track of the acks for that. like other write commands. But since its a read we also need to collect and merge all results
+                                self.pending_transactions.push((Utc::now().timestamp_millis(), command.id, command.client_id, vec![false; number_of_involed_shards as usize]));
+                            }
+                            _ => {}
+                        }
+                        // TODO: reads have to wait until the table is created. otherwise the read will fail.
+                        command.phase = Some(Phase::Prepare);
+                        if !cmd_below_10.clone().sql_cmd.keys.unwrap().is_empty() {
+                            self.mediator.send_prepare_to_shard1(cmd_below_10.clone()); // "sends" message to the shard1 to process
+                            // info!("{} send below ten to shard with command: {:?} ", self.id, cmd_below_10);
+                        }
+                        if !cmd_above_10.clone().sql_cmd.keys.unwrap().is_empty() {
+                            self.mediator.send_prepare_to_shard2(cmd_above_10.clone()); // "sends" message to the shard2 to process
+                            // info!("{} send above ten to shard with command: {:?} ", self.id, cmd_above_10);
+
+                        }
+                    }
+                    info!("{}: push command {} to pending", self.id, command.id);
+                    info!("{}: pending_transactions {:?}", self.id, self.pending_transactions);      // this vector is for keeping track of which shards yet have to ack a transaction (they do as soon as all proccessed the command) in their RSM decided on that value)
+                    info!("{}: pending_read_results {:?}", self.id, self.pending_read_results);     // this vector is for keeping track of the read results comming from the shards. The coordinator has to merge them and send them back to the client.
+                }
+            } else {
+                // After the prepare was succesfull and every shard acked the prepare, we can then commit (or abort if at least one didnt ack in specified timeout).
+                match command.phase {
+                    Some(Phase::Commit) => {
+                        info!("{}: Committing command {}", self.id, command.id);
+                    }
+                    Some(Phase::Abort) => {
+                        info!("{}: Aborting command {}", self.id, command.id);
+                    }
+                    _ => {}
+                }
+
+                // TODO: an we just sent to all shards here as the abort and commit are ignored in psql if the id is not known?
+                // check if the command_id (which is used as the pending transaction id in psql) is unqiue over all shards. If not we cant do this!
+                self.mediator.commit_or_abort_on_shard1(command.clone());
+                self.mediator.commit_or_abort_on_shard2(command);
             }
         }
     }
 
-    fn send_outgoing_msgs(&mut self) {
-        self.omnipaxos
-            .take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
+    // how to split a select command for the shards
+    fn split_select_command(&mut self, command:Command) -> (usize, Command, Command) {
+        let mut number_of_involed_shards = 0;
+        let mut cmd_below_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id,
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: command.sql_cmd.values.clone(),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+        let mut cmd_above_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id.clone(),
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: command.sql_cmd.values.clone(),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+
+        let (below_10, above_10): (Vec<String>, Vec<String>) = command.clone().sql_cmd.keys.unwrap_or_default().into_iter()
+            .partition(|key| key.parse::<i32>().unwrap_or(0) < 10);
+
+        // info!("{}: below vector is: {:?}", self.id, below_10);
+        // info!("{}: above vector is: {:?}", self.id, above_10);
+
+        if !below_10.is_empty() {
+            cmd_below_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type.clone(),
+                    table: command.sql_cmd.table.clone(),
+                    columns: command.sql_cmd.columns.clone(),
+                    values: command.sql_cmd.values.clone(),
+                    keys: Some(below_10.clone()),
+                    consistency: command.sql_cmd.consistency.clone(),
+                },
+                phase: None,
+            };
+            number_of_involed_shards += 1;
+        }
+        if !above_10.is_empty() {
+            cmd_above_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type,
+                    table: command.sql_cmd.table,
+                    columns: command.sql_cmd.columns,
+                    values: command.sql_cmd.values,
+                    keys: Some(above_10.clone()),
+                    consistency: command.sql_cmd.consistency,
+                },
+                phase: None,
+            };
+            number_of_involed_shards += 1;
+        }
+
+        // info!("{}: below vector is: {:?}", self.id, cmd_above_10.sql_cmd.keys);
+        // info!("{}: above vector is: {:?}", self.id, cmd_below_10.sql_cmd.keys);
+        (number_of_involed_shards, cmd_below_10, cmd_above_10)
+    }
+
+    // split insert command into its ranges for the shards
+    fn split_insert_command(&mut self, command:Command) -> (usize, Command, Command) {
+        let mut number_of_involed_shards = 0;
+        let mut cmd_below_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id,
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: Some(Vec::new()),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+        let mut cmd_above_10 = Command {
+            client_id: command.client_id,
+            coordinator_id: command.coordinator_id,
+            id: command.id,
+            sql_cmd: SqlCommand {
+                query_type: command.sql_cmd.query_type.clone(),
+                table: command.sql_cmd.table.clone(),
+                columns: command.sql_cmd.columns.clone(),
+                values: Some(Vec::new()),
+                keys: Some(Vec::new()),
+                consistency: command.sql_cmd.consistency.clone(),
+            },
+            phase: Some(Phase::Prepare),
+        };
+
+        let values = command.sql_cmd.values.clone().unwrap_or_default();
+        let (below_10, above_10): (Vec<String>, Vec<String>) = values.into_iter().partition(|s| {
+            // Remove parentheses then split by comma.
+            let trimmed = s.trim_matches(|c| c == '(' || c == ')');
+            let parts: Vec<&str> = trimmed.split(',').collect();
+            let num_str = parts.get(0).unwrap().trim().trim_matches('\'');
+            num_str.parse::<i32>().unwrap_or(0) < 10
+        });
+
+        // info!("{}: below vector is: {:?}", self.id, below_10);
+        // info!("{}: above vector is: {:?}", self.id, above_10);
+
+        if !below_10.is_empty() {
+            // cmd_below_10.sql_cmd.values = Some(below_10);
+            cmd_below_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type.clone(),
+                    table: command.sql_cmd.table.clone(),
+                    columns: command.sql_cmd.columns.clone(),
+                    values: Some(below_10.clone()),
+                    keys: Some(Vec::new()),
+                    consistency: command.sql_cmd.consistency.clone(),
+                },
+                phase: Some(Phase::Prepare),
+            };
+            number_of_involed_shards += 1;
+        }
+        if !above_10.is_empty() {
+            // cmd_above_10.sql_cmd.values = Some(above_10);
+            cmd_above_10 = Command {
+                client_id: command.client_id,
+                coordinator_id: command.coordinator_id,
+                id: command.id,
+                sql_cmd: SqlCommand {
+                    query_type: command.sql_cmd.query_type.clone(),
+                    table: command.sql_cmd.table.clone(),
+                    columns: command.sql_cmd.columns.clone(),
+                    values: Some(above_10.clone()),
+                    keys: Some(Vec::new()),
+                    consistency: command.sql_cmd.consistency.clone(),
+                },
+                phase: Some(Phase::Prepare),
+            };
+            number_of_involed_shards += 1;
+        }
+
+        // info!("{}: above vector is: {:?}", self.id, cmd_above_10.sql_cmd.values);
+        // info!("{}: below vector is: {:?}", self.id, cmd_below_10.sql_cmd.values);
+        (number_of_involed_shards, cmd_below_10, cmd_above_10)
+    }
+
+    // Sends outgoing messages from the primary omnipaxos instance using the standard cluster channel
+    async fn send_outgoing_msgs(&mut self) {
+        self.omnipaxos.take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
         for msg in self.omnipaxos_msg_buffer.drain(..) {
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
-            self.network.send_to_cluster(to, cluster_msg);
+            self.network.lock().await.send_to_cluster(to, cluster_msg);
         }
     }
 
@@ -281,17 +647,18 @@ impl OmniPaxosServer {
             coordinator_id: self.id,
             id: command_id,
             sql_cmd: sql_command,
+            phase: None,
         };
         self.omnipaxos
             .append(command)
             .expect("Append to Omnipaxos log failed");
     }
 
-    fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
+    async fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
         for peer in &self.peers {
             debug!("Sending start message to peer {peer}");
             let msg = ClusterMessage::LeaderStartSignal(start_time);
-            self.network.send_to_cluster(*peer, msg);
+            self.network.lock().await.send_to_cluster(*peer, msg);
         }
     }
 
@@ -299,8 +666,128 @@ impl OmniPaxosServer {
         for client_id in 1..self.config.local.num_clients as ClientId + 1 {
             debug!("Sending start message to client {client_id}");
             let msg = ServerMessage::StartSignal(start_time);
-            self.network.send_to_client(client_id, msg);
+            self.network.lock().await.send_to_client(client_id, msg);
         }
+    }
+
+    // For each shard thatis involved in the transaction, the coordinator has to keep track of the acks. If all shards acked the transaction, the coordinator can commit the transaction.
+    // this function is the receiver of the shards sending the ack acks as it marks one of the boolean as true for each ack we got. We can then actively poll the pending_transactions vector for transactions that are ready to be commited (all booleans are true).
+    pub fn ack_from_shard(&mut self, command_id: CommandId) {
+        // Find the transaction with the given command_id
+        if let Some(transaction) = self.pending_transactions.iter_mut()
+            .find(|(_, id, _, _)| *id == command_id) {
+            // Find the first unacknowledged entry and mark it as acknowledged
+            if let Some(ack) = transaction.3.iter_mut().find(|ack| !**ack) {
+            *ack = true;
+            info!("{}: Acknowledged command with id {}", self.id, command_id);
+            } else {
+            info!("{}: No unacknowledged entry found for transaction with id {}", self.id, command_id);
+            }
+        } else {
+            info!("{}: Transaction with id {} not found", self.id, command_id);
+        }
+
+    }
+
+    // same as for the ack, but for receiving the responses.
+    pub fn process_response_from_shard(&mut self, msg:ClusterMessage) {
+        if let ClusterMessage::ReadResponse(client_id, _, command_id, response) = msg {
+            if let Some((_, _, responses, _)) = self.pending_read_results.iter_mut().find(|(id, cli_id, _, _)| *id == command_id && *cli_id == client_id) {
+            responses.push(response.unwrap_or_default());
+            }
+        }
+    }
+
+    // function that implements the active pooling for completed prepare messages everyone acked or completed read transactions where every involved shard returned their response
+    async fn check_pending_transactions(&mut self) {
+        let dummy_sql_command = SqlCommand {
+            query_type: QueryType::Insert,
+            table: "dummy".to_string(),
+            columns: vec![("dummy".to_string(), "dummy".to_string())],
+            consistency: Some(Consistency::Linearizable),
+            keys: Some(vec!["dummy".to_string()]),
+            values: Some(vec!["dummy".to_string()]),
+        };      // A dummy command as we only need the transaction id in sql to commit or rollback the command. Therefore this command is never used.
+        let now = Utc::now().timestamp_millis();
+        let threshold = now - 5_000;
+
+        // CHECK FOR COMMITS
+        // completed if all shards acked
+        let completed_transactions: Vec<(Timestamp, CommandId, ClientId, Vec<bool>)> = self.pending_transactions
+            .iter()
+            .filter(|(ts, _, _, acks)| acks.iter().all(|&ack| ack))
+            .cloned()
+            .collect();
+
+        for (_, cmd_id, client_id, _) in completed_transactions {
+            let command = Command {
+                client_id: client_id,
+                coordinator_id: self.id,
+                id: cmd_id,
+                sql_cmd: dummy_sql_command.clone(),
+                phase: Some(Phase::Commit),
+            };
+            info!("{}: Completed transaction with id {}. Sending off to shard as commit", self.id, cmd_id);
+            // apend to the coordaintors log
+            self.append_commit_abort_to_log(command).await;
+            let msg = ServerMessage::Answer(cmd_id, Some("Write Transaction successfully commited!".to_string()));
+            self.network.lock().await.send_to_client(client_id, msg);
+        }
+
+        self.pending_transactions
+            .retain(|(_, _, _, acks)| !acks.iter().all(|&ack| ack));
+
+        // CHECK FOR ABORTS
+
+        let timedout_transactions: Vec<(Timestamp, CommandId, ClientId, Vec<bool>)> = self
+            .pending_transactions
+            .iter()
+            .filter(|(ts, _, _, _)| *ts <= threshold)
+            .cloned()
+            .collect();
+
+        for (_, cmd_id, client_id, _) in timedout_transactions {
+            let command = Command {
+                client_id: client_id,
+                coordinator_id: self.id,
+                id: cmd_id,
+                sql_cmd: dummy_sql_command.clone(),
+                phase: Some(Phase::Commit),
+            };
+            info!("{}: Timed out transaction with id {}. Sending off to shard as abort", self.id, cmd_id);
+            // apend to the coordaintors log
+            self.append_commit_abort_to_log(command).await;
+            let msg = ServerMessage::Answer(cmd_id, Some("Transaction aborted!".to_string()));
+            self.network.lock().await.send_to_client(client_id, msg);
+        }
+
+        self.pending_transactions
+            .retain(|(ts, _, _, _)| *ts > threshold);
+
+        // CHECK RESPONSES
+        let valid_read_results: Vec<(CommandId, ClientId, Vec<String>, i32)> = self
+            .pending_read_results
+            .iter()
+            .filter(|(_, _, responses, expected_len)| responses.len() == *expected_len as usize)
+            .cloned()
+            .collect();
+
+        for (cmd_id, client_id, responses, _) in valid_read_results {
+            info!("{}: Received read responses: {:?}", self.id, responses);
+            let response_str = responses.join(", ");
+            let msg = ServerMessage::Answer(cmd_id, Some(response_str));
+            self.network.lock().await.send_to_client(client_id, msg);
+        }
+
+        self.pending_read_results
+            .retain(|(_, _, responses, expected_len)| responses.len() != *expected_len as usize);
+    }
+
+    async fn append_commit_abort_to_log(&mut self, command: Command) {
+        self.omnipaxos
+            .append(command)
+            .expect("Append to Omnipaxos log failed");
+        self.send_outgoing_msgs().await;
     }
 
     fn save_output(&mut self) -> Result<(), std::io::Error> {
@@ -310,4 +797,6 @@ impl OmniPaxosServer {
         output_file.flush()?;
         Ok(())
     }
+
+
 }

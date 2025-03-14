@@ -1,5 +1,5 @@
 x-common-variables: &common-server-variables
-  RUST_LOG: "debug"
+  RUST_LOG: "INFO"
   SERVER_CONFIG_FILE: "/app/server-config.toml"
   CLUSTER_CONFIG_FILE: "/app/cluster-config.toml"
   OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000" # Overwrite node_addrs in cluster config TOML
@@ -58,18 +58,18 @@ services:
     volumes:
       - ./client-1-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/
-  c2:
-    image: omnipaxos-client
-    container_name: c2
-    networks:
-      - backend
-    environment:
-      RUST_LOG: "debug"
-      CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
-    volumes:
-      - ./client-2-config.toml:/app/client-config.toml
-      - ./logs/:/app/logs/
+  # c2:
+  #   image: omnipaxos-client
+  #   container_name: c2
+  #   networks:
+  #     - backend
+  #   environment:
+  #     RUST_LOG: "debug"
+  #     CONFIG_FILE: "/app/client-config.toml"
+  #     OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
+  #   volumes:
+  #     - ./client-2-config.toml:/app/client-config.toml
+  #     - ./logs/:/app/logs/
 
 networks:
   backend:

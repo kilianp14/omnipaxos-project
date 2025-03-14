@@ -10,6 +10,8 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
+        NodeRegister2(NodeId),
+        NodeRegister3(NodeId),
         ClientRegister,
     }
 
@@ -18,7 +20,7 @@ pub mod messages {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
         ReadRequest(NodeId, NodeId, CommandId, SqlCommand),
-        ReadResponse(NodeId, CommandId, Option<String>),
+        ReadResponse(NodeId, NodeId, CommandId, Option<String>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +62,14 @@ pub mod sql {
         pub coordinator_id: NodeId,
         pub id: CommandId,
         pub sql_cmd: SqlCommand,
+        pub phase: Option<Phase>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum Phase {
+        Prepare,
+        Commit,
+        Abort,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +78,7 @@ pub mod sql {
         pub table: String,
         pub columns: Vec<(String, String)>, // this is column name, type
         pub values: Option<Vec<String>>,
-        pub conditions: Option<String>,
+        pub keys: Option<Vec<String>>,
         pub consistency: Option<Consistency>,
     }
 
@@ -83,11 +93,11 @@ pub mod sql {
                     ("value".to_string(), "text".to_string()),
                 ],
                 values: None,
-                conditions: None,
+                keys: None,
                 consistency: None,
             }
         }
-        pub fn insert_cmd(key: String, value: String) -> Self {
+        pub fn insert_cmd(client_id: String, keys: Vec<String>) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
@@ -95,19 +105,22 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
-                values: Some(vec![key.clone(), value.clone()]),
-                conditions: None,
+                values: Some(keys.into_iter().map(|key| format!("('{}', '{}_value_{}')", key,client_id,key)).collect()),
+                keys: None,
+                // TODO merge conflict
+                // values: Some(vec![key.clone(), value.clone()]),
+                // conditions: None,
                 consistency: None,
             }
         }
 
-        pub fn select_cmd(key: String, consistency: Consistency) -> Self {
+        pub fn select_cmd(keys: Vec<String>, consistency: Consistency) -> Self {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
                 columns: vec![("value".to_string(), "text".to_string())],
                 values: None,
-                conditions: Some(format!("key = '{}'", key)),
+                keys: Some(keys),
                 consistency: Some(consistency),
             }
         }

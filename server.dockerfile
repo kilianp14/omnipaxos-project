@@ -38,7 +38,9 @@ RUN echo "local all all trust" > /etc/postgresql/15/main/pg_hba.conf && \
     echo "host all all 127.0.0.1/32 trust" >> /etc/postgresql/15/main/pg_hba.conf && \
     echo "host all all ::1/128 trust" >> /etc/postgresql/15/main/pg_hba.conf
 
-WORKDIR /app
+RUN sed -i 's/^max_prepared_transactions = 0/max_prepared_transactions = 100/' /etc/postgresql/15/main/postgresql.conf
+
+WORKDIR /app    
 COPY --from=builder /app/target/release/server /usr/local/bin
 EXPOSE 5432 8000
 
