@@ -21,11 +21,11 @@ pub struct ClusterConfig {
 pub struct CoordinatorConfig {
     pub location: Option<String>,
     pub server_id: NodeId,
-    pub shard_id: ShardId,
     pub num_clients: usize,
     pub listen_address: String,
     pub shards: Vec<ShardId>,
     pub shard_addrs: Vec<String>,
+    pub shard_ranges: Vec<(i64, i64)>,
     pub listen_port: u16,
     pub output_filepath: String,
 }

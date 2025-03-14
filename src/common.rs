@@ -1,8 +1,7 @@
-
-
 pub mod messages {
     use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
     use serde::{Deserialize, Serialize};
+    use sqlx::Error as SqlxError;
     use crate::common::sql::ClientId;
 
     use super::{
@@ -17,12 +16,23 @@ pub mod messages {
         CoordinatorRegister,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DatabaseError {
+        pub message: String,
+    }
+
+    impl From<SqlxError> for DatabaseError {
+        fn from(err: SqlxError) -> Self {
+            DatabaseError{message: err.to_string()}
+        }
+    }
+
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
         ReadRequest(ClientId, NodeId, CommandId, SqlCommand),
-        ReadResponse(ClientId, CommandId, Option<String>),
+        ReadResponse(ClientId, CommandId, Result<String, DatabaseError>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,26 +42,26 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
-        Answer(CommandId, Option<String>),
+        Answer(CommandId, String),
         StartSignal(Timestamp),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum CoordinatorMessage {
-        Prepare(CommandId, SqlCommand),
-        Commit(CommandId),
-        Abort(CommandId),
+        Prepare(ClientId, CommandId, SqlCommand),
+        Commit(ClientId, CommandId),
+        Abort(ClientId, CommandId),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ShardMessage {
         Ack(ClientId, CommandId),
         Nack(ClientId, CommandId),
-        Answer(ClientId, CommandId, Option<String>),
+        Answer(ClientId, CommandId, Result<String, DatabaseError>),
     }
 
     impl ServerMessage {
-        pub fn command_id(&self) -> (CommandId, Option<String>) {
+        pub fn command_id(&self) -> (CommandId, String) {
             match self {
                 ServerMessage::Answer(id, s) => (*id, s.clone()),
                 ServerMessage::StartSignal(_) => unimplemented!(),
@@ -77,8 +87,8 @@ pub mod sql {
     pub struct Command {
         pub client_id: ClientId,
         pub coordinator_id: NodeId,
-        pub id: CommandId,
-        pub sql_cmd: SqlCommand,
+        pub command_id: CommandId,
+        pub sql_cmd: Option<SqlCommand>,
         pub phase: Phase,
     }
 
@@ -94,8 +104,8 @@ pub mod sql {
         pub query_type: QueryType,
         pub table: String,
         pub columns: Vec<(String, String)>, // this is column name, type
-        pub keys: Option<Vec<String>>,
-        pub values: Option<Vec<String>>,
+        pub keys: Option<Vec<i64>>,
+        pub values: Option<Vec<Vec<String>>>,
         pub consistency: Option<Consistency>,
     }
 
@@ -105,8 +115,7 @@ pub mod sql {
                 query_type: QueryType::Create,
                 table: TABLE_NAME.to_string(),
                 columns: vec![
-                    ("id".to_string(), "serial".to_string()),
-                    ("key".to_string(), "text".to_string()),
+                    ("key".to_string(), "bigint".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
                 keys: None,
@@ -114,30 +123,34 @@ pub mod sql {
                 consistency: None,
             }
         }
-        pub fn insert_cmd(keys: Vec<String>, values: Vec<String>) -> Self {
+        pub fn insert_cmd(keys: Vec<i64>, values: Vec<String>) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
                 columns: vec![
-                    ("key".to_string(), "text".to_string()),
+                    ("key".to_string(), "bigint".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
                 keys: Some(keys),
-                values: Some(values),
+                values: Some(values.into_iter().map(|s| vec![s]).collect()),
                 consistency: None,
             }
         }
 
-        pub fn select_cmd(keys: Vec<String>, consistency: Consistency) -> Self {
+        pub fn select_cmd(keys: Vec<i64>, consistency: Consistency) -> Self {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
-                columns: vec![("value".to_string(), "text".to_string())],
+                columns: vec![
+                    ("key".to_string(), "bigint".to_string()),
+                    ("value".to_string(), "text".to_string()),
+                ],
                 keys: Some(keys),
                 values: None,
                 consistency: Some(consistency),
             }
         }
+
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Copy)]

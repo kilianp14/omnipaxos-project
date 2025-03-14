@@ -7,8 +7,6 @@ mod database;
 mod network;
 mod shard;
 
-const NETWORK_BATCH_SIZE: usize = 100;
-
 #[tokio::main]
 pub async fn main() {
     env_logger::init();

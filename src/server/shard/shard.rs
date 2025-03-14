@@ -14,12 +14,10 @@ type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
-const SHARD_TIMEOUT: Duration = Duration::from_millis(100);
 
 
 pub struct OmniPaxosShard {
     id: NodeId,
-    shard_id: ShardId,
     network: Network,
     database: Arc<Database>,
     omnipaxos: OmniPaxosInstance,
@@ -41,7 +39,6 @@ impl OmniPaxosShard {
 
         OmniPaxosShard {
             id: config.local.server_id,
-            shard_id: config.local.shard_id,
             network,
             database,
             omnipaxos,
@@ -153,7 +150,7 @@ impl OmniPaxosShard {
                 }
             }
         }
-        self.send_outgoing_msgs().await;
+        self.send_outgoing_msgs();
         received_start_signal
     }
 
@@ -172,65 +169,43 @@ impl OmniPaxosShard {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands, true).await;     // is_decided boolean = true means that we expect the shard to respond with the result to the coordiantor the query came from. (This is the case if we are doing a linearizable read)
+            self.update_database_and_respond(decided_commands).await;     // is_decided boolean = true means that we expect the shard to respond with the result to the coordiantor the query came from. (This is the case if we are doing a linearizable read)
         }
     }
 
-    async fn update_database_and_respond(&mut self, commands: Vec<Command>, is_decided: bool) {
+    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         for command in commands {
-            let response = match command.phase {
-                Phase::Prepare => self.database.prepare_command(command.sql_cmd.clone(), command.id).await,
-                Phase::Commit => self.database.commit_command(command.id).await,
-                Phase::Abort => self.database.abort_command(command.id).await,
+            let response: Result<String, DatabaseError> = match command.phase {
+                Phase::Prepare => {
+                    if let Some(sql_command) = command.sql_cmd.as_ref() {
+                        self.database.prepare_command(sql_command.clone(), command.command_id).await
+                    }
+                    else {
+                        Err(DatabaseError{message: "Empty Sql command".to_string()})
+                    }
+                },
+                Phase::Commit => self.database.commit_command(command.command_id).await,
+                Phase::Abort => self.database.abort_command(command.command_id).await,
             };
-
-            if is_decided {
-                if command.coordinator_id == self.id {
-                    match command.phase {
-                        Some(Phase::Prepare) => {
-                            match command.sql_cmd.query_type {
-                                QueryType::Select => {
-                                    // TODO: this is the only case where the read result is not coming from the same shard process as the coordinator send it from. This is the read that is with Lineraizable consistency and was therefore decided by omnipaxos.
-                                    let msg = ClusterMessage::ReadResponse(command.client_id, command.coordinator_id, command.id, response);
-                                    debug!("{} sending from shard {} to {}", self.id, self.id,command.coordinator_id);
-                                    network.send_to_cluster(command.coordinator_id, msg);
-                                    match command.sql_cmd.consistency.unwrap() {
-                                        Consistency::Linearizable => {
-                                            debug!("{} shard: Acknowledging command (that is linerarizable) {}", self.id, command.id);
-                                            self.network.send_to_coordinator(ShardMessage::Ack(command.client_id, command.id));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                _ => {
-                                    info!("{} shard: Acknowledging command {}", self.id, command.id);
-                                    self.mediator.ack_from_shard(command.id);
-                                }
+            if command.coordinator_id == self.id {
+                if let Phase::Prepare = command.phase {
+                    if let Some(sql_command) = command.sql_cmd.as_ref() {
+                        if let QueryType::Insert = sql_command.query_type {
+                            match response {
+                                Ok(_) => self.network.send_to_coordinator(ShardMessage::Ack(command.client_id, command.command_id)),
+                                Err(_) => self.network.send_to_coordinator(ShardMessage::Nack(command.client_id, command.command_id)),
                             }
+                            return;
                         }
-                        _ => {}
                     }
                 }
+                self.network.send_to_coordinator(ShardMessage::Answer(command.client_id, command.command_id, response));
             }
         }
     }
     
-    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: SqlCommand, phase: Phase) {
-        let command = Command {
-            client_id: from,
-            coordinator_id: self.id,
-            id: command_id,
-            sql_cmd: sql_command,
-            phase:phase,
-        };
-        self.omnipaxos
-            .append(command)
-            .expect("Append to Omnipaxos log failed");
-    }
-
-
     // Sends outgoing messages from the second omnipaxos instance using the cluster2 channel
-    async fn send_outgoing_msgs(&mut self) {
+    fn send_outgoing_msgs(&mut self) {
         self.omnipaxos.take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
         for msg in self.omnipaxos_msg_buffer.drain(..) {
             let to = msg.get_receiver();
@@ -240,37 +215,56 @@ impl OmniPaxosShard {
     }
 
 
-    async fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
+    fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
         for peer in &self.peers {
             debug!("Sending start message to peer {peer}");
             let msg = ClusterMessage::LeaderStartSignal(start_time);
             self.network.send_to_cluster(*peer, msg);
-
         }
     }
 
-    // confusing name, but this is the function that the coordinator of this proccess cals to send a propose to the shard
-    pub async fn send_prepare_to_shard(&mut self, command: Command) {
-        let sql_cmd = command.sql_cmd.clone();
-        match sql_cmd.query_type {
-            // selects are not decided on the shard level and the result is just send back.
-            QueryType::Select => {
-                self.handle_read_message(command.client_id,  command.id, sql_cmd).await;
+    async fn handle_coordinator_messages(&mut self, messages: &mut Vec<CoordinatorMessage>) {
+        for message in messages.drain(..) {
+            let command: Command;
+            match message {
+                CoordinatorMessage::Prepare(client_id, cmd_id, sql_command) => {
+                    if let QueryType::Select = sql_command.query_type {
+                        self.handle_read_message(client_id, cmd_id, sql_command).await;
+                        return;
+                    }
+                    command = Command {
+                        client_id: client_id,
+                        coordinator_id: self.id,
+                        command_id: cmd_id,
+                        sql_cmd: Some(sql_command),
+                        phase: Phase::Prepare,
+                    }
+                },
+                CoordinatorMessage::Commit(client_id, cmd_id) => {
+                    command = Command {
+                        client_id: client_id,
+                        coordinator_id: self.id,
+                        command_id: cmd_id,
+                        sql_cmd: None,
+                        phase: Phase::Commit,
+                    }
+                },
+                CoordinatorMessage::Abort(client_id, cmd_id) => {
+                    command = Command {
+                        client_id: client_id,
+                        coordinator_id: self.id,
+                        command_id: cmd_id,
+                        sql_cmd: None,
+                        phase: Phase::Abort,
+                    }
+                }
             }
-            _ => {
-                self.append_to_log(command.client_id, command.id, sql_cmd, command.phase);
+            self.omnipaxos
+                .append(command)
+                .expect("Append to Omnipaxos log failed");
             }
-        }
-        self.send_outgoing_msgs().await;
     }
 
-    // to send a commit and abort transaction once the prepare is already acked. This doesnt ened to have the omnipaxos stuff. We are using update_database_and_respond in two ways: 1. here just to update the databse and 2. to react to omnipaxos decide msg. these usecases are distinguished by the is_decided boolean.
-    pub async fn commit_or_abort_on_shard(&mut self, command: Command) {
-        // is decided is false here as this value is imposed by the coordiantor. aggrement is ensured as this was already proposed earlier in the 2pc protocoll. the is_decide boolean contolls wether to respond to the coordinaot with te result. which we only need if the value was freshly decided by omnipaxos (we did a Linearizable Read)
-        self.update_database_and_respond(vec![command], false).await;
-    }
-
-    // shard
     async fn handle_read_message(
         &mut self,
         client_id: ClientId,
@@ -309,26 +303,8 @@ impl OmniPaxosShard {
                 }
             }
             Consistency::Linearizable => {
-                // For linearizable consistency, we can use a read-impose operation
-                // by appending a no-op or read operation to the log
-                let read_command = Command {
-                    client_id,
-                    coordinator_id: self.id,
-                    id: command_id,
-                    sql_cmd: sql_command,
-                    phase: None,
-                };
-                // Append the read command to the log to ensure linearizability
-                match self.omnipaxos.append(read_command) {
-                    Ok(_) => {
-                        // No need to send response here as it will be sent
-                        // in update_database_and_respond when the command is decided
-                    }
-                    Err(_) => {
-                        warn!("Unable to append read command to log for linearizable read");
-                        self.network.send_to_coordinator(ShardMessage::Answer(client_id, command_id, Some("Unable to do linearizable read".to_string()))); 
-                    }
-                }
+                // TODO: Approach without sharding does not work anymore
+                self.network.send_to_coordinator(ShardMessage::Answer(client_id, command_id, Err(DatabaseError{message: "Linearizable not implemented".to_string()})));
             }
         };
     }

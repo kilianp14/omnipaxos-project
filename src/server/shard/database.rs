@@ -1,6 +1,5 @@
-use log::info;
-use omnipaxos_sql::common::sql::{Phase, QueryType, SqlCommand, CommandId};
-use sqlx::{postgres::PgQueryResult, query, query_as, Executor, PgPool};
+use omnipaxos_sql::common::{sql::{QueryType, SqlCommand, CommandId}, messages::DatabaseError};
+use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
 pub struct Database {
@@ -36,136 +35,131 @@ impl Database {
         Database { pool: temp_pool }
     }
 
-    pub async fn commit_command(&self, transaction_id: CommandId) -> Option<String> {
+    pub async fn commit_command(&self, transaction_id: CommandId) -> Result<String, DatabaseError> {
         let commit_query = format!("COMMIT PREPARED '{}'", transaction_id);
-        let response = query(&commit_query).execute(&self.pool).await.ok();
-        match response {
-            Some(res) => Some(format!("Committed Transaction {}", transaction_id)),
-            None => Some(format!("Failed to commit Transaction {}", transaction_id)),
-        }
+        sqlx::query(&commit_query).execute(&self.pool).await?;
+    
+        Ok(format!("Committed Transaction {}", transaction_id))
     }
-
-    pub async fn abort_command(&self, transaction_id: CommandId) -> Option<String> {
+    
+    pub async fn abort_command(&self, transaction_id: CommandId) -> Result<String, DatabaseError> {
         let abort_query = format!("ROLLBACK PREPARED '{}'", transaction_id);
-        let response = query(&abort_query).execute(&self.pool).await.ok();
-        match response {
-            Some(res) => Some(format!("Aborted Transaction {}", transaction_id)),
-            None => Some(format!("Failed to abort Transaction {}", transaction_id)),
-        }
+        sqlx::query(&abort_query).execute(&self.pool).await?;
+    
+        Ok(format!("Aborted Transaction {}", transaction_id))
     }
 
-    pub async fn prepare_command(&self, command: SqlCommand, id:CommandId) -> Option<String> {
+    pub async fn prepare_command(&self, command: SqlCommand, id:CommandId) -> Result<String, DatabaseError> {
         match command.query_type {
             QueryType::Select => self.handle_select(command).await,
             QueryType::Insert => self.handle_insert(command, id).await,
-            QueryType::Create => self.handle_create(command, id).await,
+            QueryType::Create => self.handle_create(command).await,
         }
     }
 
-    async fn handle_select(&self, command: SqlCommand) -> Option<String> {
-        let columns = command
-            .columns
-            .into_iter()
-            .map(|(col, _)| col)
-            .collect::<Vec<String>>()
-            .join(", ");
-        let keys = command.keys.unwrap_or_default();
-        let keys_str = keys
-            .into_iter()
-            .map(|key| format!("'{}'", key))
-            .collect::<Vec<String>>()
-            .join(", ");
+    async fn handle_select(&self, command: SqlCommand) -> Result<String, DatabaseError> {
+        if command.keys.is_none() || command.keys.as_ref().unwrap().is_empty() {
+            return Err(DatabaseError{message: "No keys provided".to_string()});
+        }
+    
+        let columns: String = if command.columns.is_empty() {
+            "*".to_string()
+        } else {
+            command
+                .columns
+                .iter()
+                .map(|(col, _)| format!("\"{}\"", col))
+                .collect::<Vec<String>>()
+                .join(", ")
+        };
+    
         let query_str = format!(
-            "SELECT {} FROM {} WHERE key IN ({})",
-            columns, command.table, keys_str
+            "SELECT {} FROM \"{}\" WHERE \"key\" = ANY($1)",
+            columns, command.table
         );
-        let rows: Option<Vec<(String,)>> = query_as(&query_str).fetch_all(&self.pool).await.ok();
-        match rows {
-            Some(values) => {
-                let result: String = values
-                    .into_iter()
-                    .map(|(s,)| s)
-                    .collect::<Vec<String>>()
-                    .join(", ");
-                Some(result)
-            }
-            None => None,
+    
+        let rows: Vec<(String,)> = sqlx::query_as(&query_str)
+            .bind(command.keys.unwrap())
+            .fetch_all(&self.pool)
+            .await?;
+    
+        if rows.is_empty() {
+            return Err(DatabaseError{message: "Rows not found".to_string()});
         }
-    }
-
-    async fn handle_insert(&self, command: SqlCommand, id:CommandId) -> Option<String> {
-        let columns = command.clone()
-            .columns
+    
+        let result = rows
             .into_iter()
-            .map(|(col, _)| col)
+            .map(|(value,)| value)
             .collect::<Vec<String>>()
             .join(", ");
-        let values: String = command.clone()
-            .values?
-            .iter()
-            .map(|i| format!("{}", i))
-            .collect::<Vec<String>>()
-            .join(", ");
-
-        let query_str = "BEGIN";
-        let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
-
-        // Execute your insert.
-        for value in command.values.unwrap_or_default() {
-            let insert_query = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                command.table, columns, value
-            );
-            let result: Option<PgQueryResult> = query(&insert_query).execute(&self.pool).await.ok();
-            if result.is_none() {
-                return Some(format!("Failed to insert row with query {}", insert_query));
-            }
-        }
-        // Prepare the transaction to make it pending.
-        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
-        let result: Option<PgQueryResult> = query(&prepare_query).execute(&self.pool).await.ok();
-
-        match result {
-            Some(res) => Some(format!("Inserted {} rows", res.rows_affected())),
-            None => Some(format!("Failed to insert row with query {}", query_str)),
-        }
+    
+        Ok(result)
     }
-
-    async fn handle_create(&self, command: SqlCommand, id:CommandId) -> Option<String> {
+    
+    async fn handle_insert(&self, command: SqlCommand, id: CommandId) -> Result<String, DatabaseError> {
+        let values = match command.values.clone() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Err(DatabaseError{message: "No values provided for insertion.".to_string()}),
+        };
+    
+        let columns: Vec<String> = command
+            .columns
+            .iter()
+            .map(|(col, _)| format!("\"{}\"", col))
+            .collect();
+        let columns_str = columns.join(", ");
+    
+        // Begin the transaction
+        sqlx::query("BEGIN").execute(&self.pool).await?;
+    
+        let insert_query = format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({})",
+            command.table,
+            columns_str,
+            values[0]
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("${}", i + 1))
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+    
+        for row in values.iter() {
+            sqlx::query(&insert_query)
+                .bind(row.clone())
+                .execute(&self.pool)
+                .await?;
+        }
+    
+        // Prepare the transaction (but do not commit yet)
+        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
+        sqlx::query(&prepare_query).execute(&self.pool).await?;
+    
+        Ok(format!("Prepared transaction '{}', awaiting commit.", id))
+    }
+    
+    async fn handle_create(&self, command: SqlCommand) -> Result<String, DatabaseError> {
+        if command.columns.is_empty() {
+            return Err(DatabaseError{message: "No columns provided.".to_string()});
+        }
+    
+        let primary_key = &command.columns[0].0;
+    
         let columns_definitions: Vec<String> = command
             .columns
             .iter()
-            .map(|(name, dtype)| format!("{} {}", name, dtype))
+            .map(|(name, dtype)| format!("\"{}\" {}", name, dtype))
             .collect();
-
+    
         let query_str = format!(
-            "CREATE TABLE IF NOT EXISTS {} ({})",
+            "CREATE TABLE IF NOT EXISTS \"{}\" ({} , PRIMARY KEY (\"{}\"))",
             command.table,
-            columns_definitions.join(", ")
+            columns_definitions.join(", "),
+            primary_key
         );
-
-        let result: Option<PgQueryResult> = query(&query_str).execute(&self.pool).await.ok();
-        
-        // Test insert values into all databases so we can do some cross shard reads
-        let insert_values: Vec<String> = (0..=20)
-            .map(|i| format!("({}, 'pre_written_{}')", i, i))
-            .collect();
-
-        let insert_query = format!(
-            "INSERT INTO {} (key, value) VALUES {}",
-            command.table,
-            insert_values.join(", ")
-        );
-
-        let result: Option<PgQueryResult> = query(&insert_query).execute(&self.pool).await.ok();
-
-        // Prepare the transaction to make it pending.
-        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
-        let result: Option<PgQueryResult> = query(&prepare_query).execute(&self.pool).await.ok();
-
-        match result {
-            Some(_) => Some(format!("Table {} rows", command.table)),
-            None => None,
-        }
+    
+        sqlx::query(&query_str).execute(&self.pool).await?;
+    
+        Ok(format!("Created table: {}", command.table))
     }
 }

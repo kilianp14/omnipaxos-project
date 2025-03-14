@@ -5,4 +5,5 @@ listen_address = "127.0.0.1"
 listen_port = 10001
 shards = [1, 2]
 shard_addrs = ["127.0.0.1:10004", "127.0.0.1:10007"]
+shard_ranges = [(0, 100), (100, 200)]
 output_filepath = "./testing_configs/logs/coordinator-1.json"

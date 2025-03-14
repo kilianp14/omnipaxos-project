@@ -1,4 +1,4 @@
-use crate::{lib::OmniPaxosSqlConfig, database::Database, network::NetworkTrait};
+use crate::network::NetworkTrait;
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -7,9 +7,9 @@ use omnipaxos::{
     OmniPaxos, OmniPaxosConfig,
 };
 use omnipaxos_sql::common::{messages::*, sql::*, utils::Timestamp};
+use omnipaxos_sql::server::configs::OmniPaxosCoordinatorConfig;
 use omnipaxos_storage::memory_storage::MemoryStorage;
-use std::sync::Arc;
-use std::{fs::File, io::Write, time::Duration};
+use std::{fs::File, io::Write, time::Duration, ops::Range, collections::HashMap};
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -18,32 +18,40 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct OmniPaxosServer {
     id: NodeId,
-    database: Arc<Database>,
     network: Box<dyn NetworkTrait>,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
-    config: OmniPaxosSqlConfig,
+    config: OmniPaxosCoordinatorConfig,
     peers: Vec<NodeId>,
+    shard_ranges: Vec<(Range<i64>, ShardId)>,
+    pending_transactions: HashMap<CommandId, (Timestamp, ClientId, Vec<(ShardId, bool)>)>,
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosSqlConfig, database: Arc<Database>, network: Box<dyn NetworkTrait>) -> Self {
+    pub async fn new(config: OmniPaxosCoordinatorConfig, network: Box<dyn NetworkTrait>) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
+        let shard_map: Vec<(Range<i64>, ShardId)> = config.clone().local.shard_ranges
+            .into_iter()
+            .zip(config.clone().local.shards.into_iter()) // Pair each range with a shard
+            .map(|((start, end), shard)| (start..end, shard))
+            .collect(); 
+        let peers = config.clone().get_peers(config.clone().local.server_id);
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
+
         // Waits for client and server network connections to be established
         OmniPaxosServer {
             id: config.local.server_id,
-            database,
             network,
             omnipaxos,
             current_decided_idx: 0,
             omnipaxos_msg_buffer,
-            peers: config.get_peers(config.local.server_id),
             config,
+            peers: peers,
+            shard_ranges: shard_map,
         }
     }
 
@@ -52,9 +60,11 @@ impl OmniPaxosServer {
         self.save_output().expect("Failed to write to file");
         let mut client_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
+        let mut shard_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         // We don't use Omnipaxos leader election at first and instead force a specific initial leader
-        self.establish_initial_leader(&mut cluster_msg_buf, &mut client_msg_buf)
-            .await;
+        self.establish_initial_leader(
+            &mut cluster_msg_buf, &mut client_msg_buf, &mut shard_msg_buf
+        ).await;
         info!{"{}: Initial election phase over", self.id};
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
@@ -68,12 +78,15 @@ impl OmniPaxosServer {
                     }
                     self.send_outgoing_msgs();
                 },
-                _ = self.network.recv_many(&mut cluster_msg_buf, &mut client_msg_buf, NETWORK_BATCH_SIZE) => {
+                _ = self.network.recv_many(&mut cluster_msg_buf, &mut client_msg_buf, &mut shard_msg_buf, NETWORK_BATCH_SIZE) => {
                     if !cluster_msg_buf.is_empty() {
                         self.handle_cluster_messages(&mut cluster_msg_buf).await;
                     }
                     if !client_msg_buf.is_empty() {
                         self.handle_client_messages(&mut client_msg_buf).await;
+                    }
+                    if !shard_msg_buf.is_empty() {
+                        self.handle_shard_messages(shard_msg_buf).await;
                     }
                 },
             }
@@ -87,6 +100,7 @@ impl OmniPaxosServer {
         &mut self,
         cluster_msg_buffer: &mut Vec<(NodeId, ClusterMessage)>,
         client_msg_buffer: &mut Vec<(ClientId, ClientMessage)>,
+        shard_msg_buffer: &mut Vec<(ShardId, ShardMessage)>,
     ) {
         let mut leader_takeover_interval = tokio::time::interval(LEADER_WAIT);
         loop {
@@ -105,7 +119,7 @@ impl OmniPaxosServer {
                     self.omnipaxos.try_become_leader();
                     self.send_outgoing_msgs();
                 },
-                _ = self.network.recv_many(cluster_msg_buffer, client_msg_buffer, NETWORK_BATCH_SIZE) => {
+                _ = self.network.recv_many(cluster_msg_buffer, client_msg_buffer, shard_msg_buffer, NETWORK_BATCH_SIZE) => {
                     if !cluster_msg_buffer.is_empty() {
                         let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
                         if recv_start {
@@ -115,13 +129,15 @@ impl OmniPaxosServer {
                     if !client_msg_buffer.is_empty() {
                         self.handle_client_messages(client_msg_buffer).await;
                     }
+                    if !shard_msg_buffer.is_empty() {
+                        self.handle_shard_messages(shard_msg_buffer).await;
+                    }
                 },
             }
         }
     }
 
     async fn handle_decided_entries(&mut self) {
-        // TODO: Can use a read_raw here to avoid allocation
         let new_decided_idx = self.omnipaxos.get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
             let decided_entries = self
@@ -136,19 +152,75 @@ impl OmniPaxosServer {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands).await;
+            self.process_decided_entries(decided_commands);
         }
     }
 
-    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
-        // TODO: batching responses possible here (batch at handle_cluster_messages)
-        // This todo was already in the repo, dont think we actually need to do batching
-        // For now lets just do write-through
+    fn process_decided_entries(&mut self, commands: Vec<Command>) {
         for command in commands {
-            let response = self.database.handle_command(command.sql_cmd).await;
-            if command.coordinator_id == self.id {
-                let msg = ServerMessage::Answer(command.id, response);
-                self.network.send_to_client(command.client_id, msg);
+            let shard_messages: Vec<(ShardId, CoordinatorMessage)> = match command.phase {
+                Phase::Prepare => {
+                    if let Some(sql_command) = command.sql_cmd {
+                        match sql_command.query_type {
+                            QueryType::Create => {
+                                let shard_sql_commands: Vec<(ShardId, SqlCommand)> = self.config.local.shards.clone().into_iter().map(|n| (n, sql_command.clone())).collect();
+                                shard_sql_commands
+                                    .into_iter()
+                                    .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.client_id, command.command_id, sql_command)))
+                                    .collect()
+                            },
+                            QueryType::Insert => {
+                                let shard_sql_commands = self.split_by_shard(sql_command);
+                                if shard_sql_commands.is_empty() {
+                                    self.network.send_to_client(command.client_id, ServerMessage::Answer(command.command_id, "All keys invalid".to_string()));
+                                    continue;
+                                }
+                                let shards_in_transaction = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| (shard_id, false)).collect();
+                                self.pending_transactions.insert(command.command_id, (Utc::now().timestamp_millis(), command.client_id, shards_in_transaction));
+                                shard_sql_commands
+                                    .into_iter()
+                                    .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.client_id, command.command_id, sql_command)))
+                                    .collect()
+                            },
+                            QueryType::Select => {
+                                let shard_sql_commands = self.split_by_shard(sql_command);
+                                if shard_sql_commands.is_empty() {
+                                    self.network.send_to_client(command.client_id, ServerMessage::Answer(command.command_id, "All keys invalid".to_string()));
+                                    continue;
+                                }
+                                shard_sql_commands
+                                    .into_iter()
+                                    .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.client_id, command.command_id, sql_command)))
+                                    .collect()
+                            }
+                        }
+                    }
+                    else {
+                        warn!("Empty sql command in prepare phase");
+                        continue;
+                    }
+                },
+                Phase::Commit => {
+                    if let Some((_, _, involved_shards)) = self.pending_transactions.get(&command.command_id) {
+                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Commit(command.client_id, command.command_id))).collect()
+                    }
+                    else {
+                        warn!("Command to be committed that is not in pending transactions");
+                        continue;
+                    }
+                },
+                Phase::Abort => {
+                    if let Some((_, _, involved_shards)) = self.pending_transactions.get(&command.command_id) {
+                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Abort(command.client_id, command.command_id))).collect()
+                    }
+                    else {
+                        warn!("Command to be committed that is not in pending transactions");
+                        continue;
+                    }
+                }
+            };
+            for (shard_id, shard_msg) in shard_messages {
+                self.network.send_to_shard(shard_id, shard_msg);
             }
         }
     }
@@ -167,80 +239,11 @@ impl OmniPaxosServer {
         for (from, message) in messages.drain(..) {
             match message {
                 ClientMessage::Handle(command_id, sql_command) => match sql_command.query_type {
-                    QueryType::Select => {
-                        self.handle_read_message(from, command_id, sql_command)
-                            .await;
-                    }
-                    _ => self.append_to_log(from, command_id, sql_command),
+                    _ => self.append_to_log(from, command_id, Some(sql_command), Phase::Prepare),
                 },
             }
         }
         self.send_outgoing_msgs();
-    }
-
-    async fn handle_read_message(
-        &mut self,
-        client_id: ClientId,
-        command_id: CommandId,
-        sql_command: SqlCommand,
-    ) {
-        match sql_command
-            .consistency
-            .clone()
-            .unwrap_or(Consistency::Local)
-        {
-            Consistency::Local => {
-                // Read from local DB directly
-                let response = self.database.handle_command(sql_command).await;
-                let msg = ServerMessage::Answer(command_id, response);
-                self.network.send_to_client(client_id, msg);
-            }
-            Consistency::Leader => {
-                if let Some((leader_id, is_accept_phase)) = self.omnipaxos.get_current_leader() {
-                    if leader_id == self.id && is_accept_phase {
-                        // We are the leader, process locally
-                        let response = self.database.handle_command(sql_command).await;
-                        let msg = ServerMessage::Answer(command_id, response);
-                        self.network.send_to_client(client_id, msg);
-                    } else {
-                        // Forward to leader
-                        let forward_msg = ClusterMessage::ReadRequest(
-                            client_id,
-                            self.id,
-                            command_id,
-                            sql_command,
-                        );
-                        info!("{}: Forwarding read request to leader {}", self.id, leader_id);
-
-                        self.network.send_to_cluster(leader_id, forward_msg);
-                    }
-                }
-            }
-            Consistency::Linearizable => {
-                // For linearizable consistency, we can use a read-impose operation
-                // by appending a no-op or read operation to the log
-                let read_command = Command {
-                    client_id,
-                    coordinator_id: self.id,
-                    id: command_id,
-                    sql_cmd: sql_command,
-                };
-                // Append the read command to the log to ensure linearizability
-                match self.omnipaxos.append(read_command) {
-                    Ok(_) => {
-                        // TODO: Verify this works as expected.
-                        // The read will be processed when it's decided
-                        // No need to send response here as it will be sent
-                        // in update_database_and_respond when the command is decided
-                    }
-                    Err(e) => {
-                        let response = format!("Failed to achieve linearizable read: {:?}", e);
-                        let msg = ServerMessage::Answer(command_id, Some(response));
-                        self.network.send_to_client(client_id, msg);
-                    }
-                }
-            }
-        };
     }
 
     async fn handle_cluster_messages(
@@ -260,27 +263,24 @@ impl OmniPaxosServer {
                     received_start_signal = true;
                     self.send_client_start_signals(start_time).await;
                 }
-                ClusterMessage::ReadRequest(client_id, sender_id, command_id, sql_command) => {
-                    let response = self.database.handle_command(sql_command).await;
-                    let msg = ClusterMessage::ReadResponse(client_id, command_id, response);
-                    self.network.send_to_cluster(sender_id, msg);
-                }
-                ClusterMessage::ReadResponse(client_id, command_id, response) => {
-                    let msg = ServerMessage::Answer(command_id, response);
-                    self.network.send_to_client(client_id, msg);
-                }
+                _ => {warn!("Weird message received from cluster")}
             }
         }
         self.send_outgoing_msgs();
         received_start_signal
     }
 
-    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: SqlCommand) {
+    async fn handle_shard_messages() {
+
+    }
+
+    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: Option<SqlCommand>, phase: Phase) {
         let command = Command {
             client_id: from,
             coordinator_id: self.id,
-            id: command_id,
+            command_id: command_id,
             sql_cmd: sql_command,
+            phase: phase,
         };
         self.omnipaxos
             .append(command)
@@ -301,6 +301,47 @@ impl OmniPaxosServer {
             let msg = ServerMessage::StartSignal(start_time);
             self.network.send_to_client(client_id, msg);
         }
+    }
+
+    fn split_by_shard(&self, sql_command: SqlCommand) -> Vec<(ShardId, SqlCommand)> {
+        if let (Some(all_keys), Some(all_values)) = (sql_command.keys.clone(), sql_command.values.clone()){
+            let mut shard_map: HashMap<ShardId, (Vec<i64>, Vec<Vec<String>>)> = HashMap::new();
+
+            for (key, value) in all_keys.into_iter().zip(all_values.into_iter()) {
+                if let Some(shard_id) = self.find_shard_for_key(key) {
+                    shard_map
+                        .entry(*shard_id)
+                        .or_insert_with(|| (Vec::new(), Vec::new()))
+                        .0
+                        .push(key.clone());
+                    shard_map.get_mut(&shard_id).unwrap().1.push(value.clone());
+                }
+            }
+    
+            shard_map
+                .into_iter()
+                .map(|(shard_id, (keys, values))| {
+                    (
+                        shard_id,
+                        SqlCommand {
+                            query_type: sql_command.query_type.clone(),
+                            table: sql_command.table.clone(),
+                            columns: sql_command.columns.clone(),
+                            keys: Some(keys),
+                            values: Some(values),
+                            consistency: sql_command.consistency.clone(),
+                        },
+                    )
+                })
+                .collect()
+        }
+        else {
+            return Vec::new();
+        }
+    }
+
+    fn find_shard_for_key(&self, key: i64) -> Option<&ShardId> {
+        self.shard_ranges.iter().find(|(range, _)| range.contains(&key)).map(|(_, shard)| shard)
     }
 
     fn save_output(&mut self) -> Result<(), std::io::Error> {
