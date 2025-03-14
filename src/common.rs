@@ -97,7 +97,8 @@ pub mod sql {
                 consistency: None,
             }
         }
-        pub fn insert_cmd(client_id: String, keys: Vec<String>) -> Self {
+
+        pub fn insert_cmd(key: String, value: String) -> Self {
             Self {
                 query_type: QueryType::Insert,
                 table: TABLE_NAME.to_string(),
@@ -105,22 +106,48 @@ pub mod sql {
                     ("key".to_string(), "text".to_string()),
                     ("value".to_string(), "text".to_string()),
                 ],
-                values: Some(keys.into_iter().map(|key| format!("('{}', '{}_value_{}')", key,client_id,key)).collect()),
+                values: Some(vec![key.clone(), value.clone()]),
                 keys: None,
-                // TODO merge conflict
-                // values: Some(vec![key.clone(), value.clone()]),
-                // conditions: None,
                 consistency: None,
             }
         }
 
-        pub fn select_cmd(keys: Vec<String>, consistency: Consistency) -> Self {
+        pub fn insert_multiple_cmd(client_id: String, keys: Vec<String>) -> Self {
+            Self {
+                query_type: QueryType::Insert,
+                table: TABLE_NAME.to_string(),
+                columns: vec![
+                    ("key".to_string(), "text".to_string()),
+                    ("value".to_string(), "text".to_string()),
+                ],
+                values: Some(
+                    keys.into_iter()
+                        .map(|key| format!("('{}', '{}_value_{}')", key, client_id, key))
+                        .collect(),
+                ),
+                keys: None,
+                consistency: None,
+            }
+        }
+
+        pub fn select_multiple_cmd(keys: Vec<String>, consistency: Consistency) -> Self {
             Self {
                 query_type: QueryType::Select,
                 table: TABLE_NAME.to_string(),
                 columns: vec![("value".to_string(), "text".to_string())],
                 values: None,
                 keys: Some(keys),
+                consistency: Some(consistency),
+            }
+        }
+
+        pub fn select_cmd(key: String, consistency: Consistency) -> Self {
+            Self {
+                query_type: QueryType::Select,
+                table: TABLE_NAME.to_string(),
+                columns: vec![("value".to_string(), "text".to_string())],
+                values: None,
+                keys: Some(vec![format!("key = '{}'", key)]),
                 consistency: Some(consistency),
             }
         }

@@ -1,19 +1,13 @@
 use crate::{
-    configs::OmniPaxosSqlConfig, database::Database, network::Network, network_test::TestNetwork,
-    server::Mediator, server::OmniPaxosServer, shard::Shard,
+    configs::OmniPaxosSqlConfig, database::Database, network::Network, server::Mediator,
+    server::OmniPaxosServer, shard::Shard,
 };
 use env_logger;
-use log::info;
-use log::*;
-use network::NetworkTrait;
 mod shard;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self};
 use std::sync::Arc;
-use std::thread;
-use tokio::{join, net, sync::Mutex};
+use tokio::sync::Mutex;
 
 mod configs;
 mod database;
@@ -83,7 +77,7 @@ pub async fn main() {
         shard2.run(rx_shard2).await;
     });
 
-    tokio::join!(server_task, shard_task1, shard_task2);
+    let _ = tokio::join!(server_task, shard_task1, shard_task2);
     // let mut server = OmniPaxosServer::new(server_config, db, network).await;
     // server.run().await;
 }

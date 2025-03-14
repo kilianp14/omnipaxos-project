@@ -1,28 +1,34 @@
-use futures::{SinkExt, StreamExt};
+use crate::{configs::OmniPaxosSqlConfig, network::NetworkTrait};
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use log::*;
-use omnipaxos::messages::{Message, sequence_paxos::{PaxosMessage, PaxosMsg, Decide}};
+use omnipaxos::messages::{
+    sequence_paxos::{Decide, PaxosMessage, PaxosMsg},
+    Message,
+};
+use omnipaxos_sql::common::utils::frame_cluster_connection;
 use omnipaxos_sql::common::{
     messages::*,
     sql::{ClientId, NodeId},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio_serde::{formats::Bincode, Framed};
-use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
-use std::{net::{SocketAddr, ToSocketAddrs}, vec};
-use std::time::Duration;
 use std::str::FromStr;
+use std::time::Duration;
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    vec,
+};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::{
-    select,
     net::{TcpListener, TcpStream},
+    select,
     sync::mpsc::Receiver,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
-use serde::{Serialize, Deserialize};
-
-use crate::{configs::OmniPaxosSqlConfig, network::NetworkTrait};
+use tokio_serde::{formats::Bincode, Framed};
+use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerAnswer {
@@ -72,14 +78,20 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
 
 #[async_trait]
 impl NetworkTrait for TestNetwork {
-
     fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
         if let Some((sending, _)) = self.disconnected.get_mut(&to) {
             sending.push(msg);
-        }
-        else if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
-            PaxosMessage { from: _, to: node_id, msg: PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) }
-        )) = msg {
+        } else if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(PaxosMessage {
+            from: _,
+            to: node_id,
+            msg:
+                PaxosMsg::Decide(Decide {
+                    n: _,
+                    seq_num: _,
+                    decided_idx: _,
+                }),
+        })) = msg
+        {
             match &mut self.coordinator_connection {
                 Some(ref mut connection) => {
                     if let Err(err) = connection.send(ServerAnswer::Decide(node_id, msg)) {
@@ -89,8 +101,7 @@ impl NetworkTrait for TestNetwork {
                 }
                 None => warn!("Not connected to coordinator"),
             }
-        }
-        else {
+        } else {
             match self.cluster_id_to_idx(to) {
                 Some(idx) => match &mut self.peer_connections[idx] {
                     Some(ref mut connection) => {
@@ -169,7 +180,6 @@ impl NetworkTrait for TestNetwork {
     }
 }
 
-
 impl TestNetwork {
     pub async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self {
         let (listen_address, node_addresses) = get_addrs(config.clone());
@@ -184,7 +194,8 @@ impl TestNetwork {
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peer_addresses.len(), Default::default);
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(batch_size);
-        let (coordinator_message_sender, coordinator_messages) = tokio::sync::mpsc::channel(batch_size);
+        let (coordinator_message_sender, coordinator_messages) =
+            tokio::sync::mpsc::channel(batch_size);
         let disconnected = HashMap::new();
         let mut network = Self {
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
@@ -290,6 +301,10 @@ impl TestNetwork {
                     batch_size,
                     client_message_sender,
                 ))
+            }
+            Some(Ok(_)) => {
+                error!("Unexpected handshake message");
+                return;
             }
             Some(Err(err)) => {
                 error!("Error deserializing handshake: {:?}", err);
@@ -498,10 +513,7 @@ impl CoordinatorConnection {
         }
     }
 
-    pub fn send(
-        &mut self,
-        msg: ServerAnswer,
-    ) -> Result<(), mpsc::error::SendError<ServerAnswer>> {
+    pub fn send(&mut self, msg: ServerAnswer) -> Result<(), mpsc::error::SendError<ServerAnswer>> {
         self.outgoing_messages.send(msg)
     }
 
@@ -536,15 +548,15 @@ pub type ToNodeConnection = Framed<
     Bincode<(), ClusterMessage>,
 >;
 
-pub fn frame_cluster_connection(stream: TcpStream) -> (FromNodeConnection, ToNodeConnection) {
-    let (reader, writer) = stream.into_split();
-    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
-    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
-    (
-        FromNodeConnection::new(stream, Bincode::default()),
-        ToNodeConnection::new(sink, Bincode::default()),
-    )
-}
+// pub fn frame_cluster_connection(stream: TcpStream) -> (FromNodeConnection, ToNodeConnection) {
+//     let (reader, writer) = stream.into_split();
+//     let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
+//     let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
+//     (
+//         FromNodeConnection::new(stream, Bincode::default()),
+//         ToNodeConnection::new(sink, Bincode::default()),
+//     )
+// }
 
 // pub type ServerConnection = Framed<
 //     CodecFramed<TcpStream, LengthDelimitedCodec>,
@@ -552,7 +564,6 @@ pub fn frame_cluster_connection(stream: TcpStream) -> (FromNodeConnection, ToNod
 //     ClientMessage,
 //     Bincode<ServerMessage, ClientMessage>,
 // >;
-
 
 pub type FromClientConnection = Framed<
     FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
@@ -568,9 +579,7 @@ pub type ToClientConnection = Framed<
     Bincode<(), ServerAnswer>,
 >;
 
-pub fn frame_servers_connection(
-    stream: TcpStream,
-) -> (FromClientConnection, ToClientConnection) {
+pub fn frame_servers_connection(stream: TcpStream) -> (FromClientConnection, ToClientConnection) {
     let (reader, writer) = stream.into_split();
     let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
     let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());

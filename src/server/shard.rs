@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosSqlConfig, database::Database, network::{self, Network}, server::OmniPaxosServer, server::MediatorMessage, server::Mediator};
+use crate::{configs::OmniPaxosSqlConfig, database::Database, network::{Network},  server::MediatorMessage, server::Mediator};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -6,17 +6,11 @@ use omnipaxos::{
     util::{LogEntry, NodeId},
     OmniPaxos, OmniPaxosConfig,
 };
-use serde::de::value::U64Deserializer;
-use std::sync::mpsc::{self, Sender, Receiver};
-use std::thread;
+use std::sync::mpsc::{Receiver};
 use omnipaxos_sql::common::{messages::*, sql::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::sync::Arc;
 use std::{fs::File, io::Write, time::Duration};
-use tokio::{net, sync::Mutex};
-use std::rc::Rc;
-use std::cell::RefCell;
-use async_trait::async_trait;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -75,7 +69,7 @@ impl Shard {
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
         // let mut shardTimeoutInterval = tokio::time::interval(SHARD_TIMEOUT);
-        let mut mpscTimeoutInterval = tokio::time::interval(SHARD_TIMEOUT);
+        let mut mpsc_timeout_interval = tokio::time::interval(SHARD_TIMEOUT);
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
@@ -92,7 +86,7 @@ impl Shard {
                 } => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
                 },
-                _ = mpscTimeoutInterval.tick() => {
+                _ = mpsc_timeout_interval.tick() => {
                     let mut messages = Vec::new();
                     while let Ok(message) = rx.try_recv() {
                         messages.push(message);
@@ -162,7 +156,7 @@ impl Shard {
                     self.omnipaxos.handle_incoming(m);
                     self.handle_decided_shard_entries().await;
                 }
-                ClusterMessage::LeaderStartSignal(start_time) => {
+                ClusterMessage::LeaderStartSignal(_start_time) => {
                     debug!("Received start message from peer {from}");
                     received_start_signal = true;
                     // self.send_client_start_signals(start_time).await;
@@ -384,10 +378,9 @@ impl Shard {
                         // No need to send response here as it will be sent
                         // in update_database_and_respond when the command is decided
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         // TODO: implement this special case to respond to the coordinator with a special abort message, that removes this transaction from the pending transactions vector and sends abort to client
-
-                        // somethings one the lines of this but this left over from somwhere else
+                        // Sometimes one the lines of this but this left over from somwhere else
                         // let response = format!("Failed to achieve linearizable read: {:?}", e);
                         // let msg = ClusterMessage::ReadResponse(client_id, coordinator_id, command_id, Some(response));
                         // info!("{} sending from shard {} to {}", self.id, self.id,coordinator_id);
