@@ -2,7 +2,6 @@ pub mod messages {
     use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
     use serde::{Deserialize, Serialize};
     use sqlx::Error as SqlxError;
-    use crate::common::sql::ClientId;
 
     use super::{
         sql::{Command, CommandId, SqlCommand},
@@ -31,8 +30,8 @@ pub mod messages {
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
-        ReadRequest(ClientId, NodeId, CommandId, SqlCommand),
-        ReadResponse(ClientId, CommandId, Result<String, DatabaseError>),
+        ReadRequest(NodeId, CommandId, SqlCommand),
+        ReadResponse(CommandId, Result<String, DatabaseError>),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,16 +47,17 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum CoordinatorMessage {
-        Prepare(ClientId, CommandId, SqlCommand),
-        Commit(ClientId, CommandId),
-        Abort(ClientId, CommandId),
+        Execute(CommandId, SqlCommand),
+        Prepare(CommandId, SqlCommand),
+        Commit(CommandId),
+        Abort(CommandId),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ShardMessage {
-        Ack(ClientId, CommandId),
-        Nack(ClientId, CommandId),
-        Answer(ClientId, CommandId, Result<String, DatabaseError>),
+        Ack(CommandId),
+        Nack(CommandId),
+        Answer(CommandId, Result<String, DatabaseError>),
     }
 
     impl ServerMessage {
@@ -94,6 +94,7 @@ pub mod sql {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum Phase {
+        Execute,
         Prepare,
         Commit,
         Abort,

@@ -49,10 +49,26 @@ impl Database {
         Ok(format!("Aborted Transaction {}", transaction_id))
     }
 
-    pub async fn prepare_command(&self, command: SqlCommand, id:CommandId) -> Result<String, DatabaseError> {
+    pub async  fn prepare_command(&self, command: SqlCommand, id: CommandId) -> Result<String, DatabaseError> {
+        // Begin the transaction
+        sqlx::query("BEGIN").execute(&self.pool).await?;
+
+        let result = self.execute_command(command).await;
+        match result {
+            Ok(message) => {
+                let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
+                sqlx::query(&prepare_query).execute(&self.pool).await?;
+            
+                Ok(format!("Prepared transaction '{}': {}", id, message))
+            },
+            Err(err) => Err(err)
+        }
+    }
+
+    pub async fn execute_command(&self, command: SqlCommand) -> Result<String, DatabaseError> {
         match command.query_type {
             QueryType::Select => self.handle_select(command).await,
-            QueryType::Insert => self.handle_insert(command, id).await,
+            QueryType::Insert => self.handle_insert(command).await,
             QueryType::Create => self.handle_create(command).await,
         }
     }
@@ -96,7 +112,7 @@ impl Database {
         Ok(result)
     }
     
-    async fn handle_insert(&self, command: SqlCommand, id: CommandId) -> Result<String, DatabaseError> {
+    async fn handle_insert(&self, command: SqlCommand) -> Result<String, DatabaseError> {
         let values = match command.values.clone() {
             Some(v) if !v.is_empty() => v,
             _ => return Err(DatabaseError{message: "No values provided for insertion.".to_string()}),
@@ -108,9 +124,6 @@ impl Database {
             .map(|(col, _)| format!("\"{}\"", col))
             .collect();
         let columns_str = columns.join(", ");
-    
-        // Begin the transaction
-        sqlx::query("BEGIN").execute(&self.pool).await?;
     
         let insert_query = format!(
             "INSERT INTO \"{}\" ({}) VALUES ({})",
@@ -130,12 +143,7 @@ impl Database {
                 .execute(&self.pool)
                 .await?;
         }
-    
-        // Prepare the transaction (but do not commit yet)
-        let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
-        sqlx::query(&prepare_query).execute(&self.pool).await?;
-    
-        Ok(format!("Prepared transaction '{}', awaiting commit.", id))
+        Ok(format!("Inserted {} rows", values.len()))
     }
     
     async fn handle_create(&self, command: SqlCommand) -> Result<String, DatabaseError> {

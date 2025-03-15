@@ -26,6 +26,7 @@ pub struct OmniPaxosServer {
     peers: Vec<NodeId>,
     shard_ranges: Vec<(Range<i64>, ShardId)>,
     pending_transactions: HashMap<CommandId, (Timestamp, ClientId, Vec<(ShardId, bool)>)>,
+    pending_executions: HashMap<CommandId, (Timestamp, ClientId, Vec<(ShardId, Option<Result<String, DatabaseError>>)>)>,
 }
 
 impl OmniPaxosServer {
@@ -42,7 +43,6 @@ impl OmniPaxosServer {
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
 
-        // Waits for client and server network connections to be established
         OmniPaxosServer {
             id: config.local.server_id,
             network,
@@ -52,6 +52,8 @@ impl OmniPaxosServer {
             config,
             peers: peers,
             shard_ranges: shard_map,
+            pending_transactions: HashMap::new(),
+            pending_executions: HashMap::new(),
         }
     }
 
@@ -157,66 +159,55 @@ impl OmniPaxosServer {
     }
 
     fn process_decided_entries(&mut self, commands: Vec<Command>) {
-        for command in commands {
+        // iterate over all commands that we are the coordinator for
+        for command in commands.into_iter().filter(|cmd| cmd.coordinator_id == self.id) {
             let shard_messages: Vec<(ShardId, CoordinatorMessage)> = match command.phase {
                 Phase::Prepare => {
                     if let Some(sql_command) = command.sql_cmd {
-                        match sql_command.query_type {
-                            QueryType::Create => {
-                                let shard_sql_commands: Vec<(ShardId, SqlCommand)> = self.config.local.shards.clone().into_iter().map(|n| (n, sql_command.clone())).collect();
-                                shard_sql_commands
-                                    .into_iter()
-                                    .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.client_id, command.command_id, sql_command)))
-                                    .collect()
-                            },
-                            QueryType::Insert => {
-                                let shard_sql_commands = self.split_by_shard(sql_command);
-                                if shard_sql_commands.is_empty() {
-                                    self.network.send_to_client(command.client_id, ServerMessage::Answer(command.command_id, "All keys invalid".to_string()));
-                                    continue;
-                                }
-                                let shards_in_transaction = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| (shard_id, false)).collect();
-                                self.pending_transactions.insert(command.command_id, (Utc::now().timestamp_millis(), command.client_id, shards_in_transaction));
-                                shard_sql_commands
-                                    .into_iter()
-                                    .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.client_id, command.command_id, sql_command)))
-                                    .collect()
-                            },
-                            QueryType::Select => {
-                                let shard_sql_commands = self.split_by_shard(sql_command);
-                                if shard_sql_commands.is_empty() {
-                                    self.network.send_to_client(command.client_id, ServerMessage::Answer(command.command_id, "All keys invalid".to_string()));
-                                    continue;
-                                }
-                                shard_sql_commands
-                                    .into_iter()
-                                    .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.client_id, command.command_id, sql_command)))
-                                    .collect()
-                            }
+                        let shard_sql_commands: Vec<(ShardId, SqlCommand)>;
+                        if matches!(sql_command.query_type, QueryType::Create) {
+                            shard_sql_commands = self.config.local.shards.clone().into_iter().map(|n| (n, sql_command.clone())).collect();
                         }
+                        else {
+                            shard_sql_commands = self.split_by_shard(sql_command);
+                        }
+                        if shard_sql_commands.is_empty() {
+                            self.network.send_to_client(command.client_id, ServerMessage::Answer(command.command_id, "All keys invalid".to_string()));
+                            continue;
+                        }
+                        let shards_in_transaction = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| (shard_id, false)).collect();
+                        self.pending_transactions.insert(command.command_id, (Utc::now().timestamp_millis(), command.client_id, shards_in_transaction));
+                        shard_sql_commands
+                            .into_iter()
+                            .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.command_id, sql_command)))
+                            .collect()
                     }
                     else {
-                        warn!("Empty sql command in prepare phase");
+                        error!("Empty sql command in prepare phase");
                         continue;
                     }
                 },
                 Phase::Commit => {
                     if let Some((_, _, involved_shards)) = self.pending_transactions.get(&command.command_id) {
-                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Commit(command.client_id, command.command_id))).collect()
+                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Commit(command.command_id))).collect()
                     }
                     else {
-                        warn!("Command to be committed that is not in pending transactions");
+                        error!("Command to be committed that is not in pending transactions");
                         continue;
                     }
                 },
                 Phase::Abort => {
                     if let Some((_, _, involved_shards)) = self.pending_transactions.get(&command.command_id) {
-                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Abort(command.client_id, command.command_id))).collect()
+                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Abort(command.command_id))).collect()
                     }
                     else {
-                        warn!("Command to be committed that is not in pending transactions");
+                        error!("Command to be committed that is not in pending transactions");
                         continue;
                     }
+                },
+                Phase::Execute => {
+                    error!("Execute commands should not be in the log");
+                    continue;
                 }
             };
             for (shard_id, shard_msg) in shard_messages {
@@ -238,18 +229,30 @@ impl OmniPaxosServer {
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Handle(command_id, sql_command) => match sql_command.query_type {
-                    _ => self.append_to_log(from, command_id, Some(sql_command), Phase::Prepare),
+                ClientMessage::Handle(command_id, sql_command) => {
+                    // For leader and local reads, we dont have to start a transaction
+                    if matches!(sql_command.query_type, QueryType::Select) && matches!(sql_command.consistency, Some(Consistency::Leader) | Some(Consistency::Local)) {
+                        let shard_sql_commands = self.split_by_shard(sql_command);
+                        if shard_sql_commands.is_empty() {
+                            self.network.send_to_client(from,  ServerMessage::Answer(command_id, "All keys invalid".to_string()));
+                            continue;
+                        }
+                        let shards_in_execution = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| (shard_id, None)).collect();
+                        self.pending_executions.insert(command_id, (Utc::now().timestamp_millis(), from, shards_in_execution));
+                        for (shard_id, shard_sql) in shard_sql_commands {
+                            self.network.send_to_shard(shard_id, CoordinatorMessage::Execute(command_id, shard_sql));
+                        }
+                    }
+                    else {
+                        self.append_to_log(from, command_id, Some(sql_command), Phase::Prepare);
+                    }
                 },
             }
         }
         self.send_outgoing_msgs();
     }
 
-    async fn handle_cluster_messages(
-        &mut self,
-        messages: &mut Vec<(NodeId, ClusterMessage)>,
-    ) -> bool {
+    async fn handle_cluster_messages(&mut self, messages: &mut Vec<(NodeId, ClusterMessage)>) -> bool {
         let mut received_start_signal = false;
         for (from, message) in messages.drain(..) {
             trace!("{}: Received {message:?}", self.id);
@@ -270,8 +273,10 @@ impl OmniPaxosServer {
         received_start_signal
     }
 
-    async fn handle_shard_messages() {
+    async fn handle_shard_messages(&mut self, messages: &mut Vec<(ShardId, ShardMessage)>) {
+        for (from, message) in messages.drain(..){
 
+        }
     }
 
     fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: Option<SqlCommand>, phase: Phase) {

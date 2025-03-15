@@ -137,15 +137,15 @@ impl OmniPaxosShard {
                     debug!("Received start message from peer {from}");
                     received_start_signal = true;
                 }
-                ClusterMessage::ReadRequest(client_id, sender_id, command_id, sql_command) => {
-                    let response = self.database.prepare_command(sql_command, command_id).await;
-                    let msg = ClusterMessage::ReadResponse(client_id, command_id, response);
+                ClusterMessage::ReadRequest(sender_id, command_id, sql_command) => {
+                    let response = self.database.execute_command(sql_command).await;
+                    let msg = ClusterMessage::ReadResponse(command_id, response);
                     self.network.send_to_cluster(sender_id, msg);
                 }
-                ClusterMessage::ReadResponse(client_id, command_id, response) => {
+                ClusterMessage::ReadResponse(command_id, response) => {
                     // will be always the shard that also send the cluster so we can just return result to our own coordinator
                     // This is due to the fact that a ReadRequest responds with the result to the shard first, who then forwards it to its own coordaintor, who also sent the query originally. We could skip this step over the intermediate shard, but this is also fine. (one more message)
-                    let msg = ShardMessage::Answer(client_id, command_id, response);
+                    let msg = ShardMessage::Answer(command_id, response);
                     self.network.send_to_coordinator(msg);
                 }
             }
@@ -169,7 +169,7 @@ impl OmniPaxosShard {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands).await;     // is_decided boolean = true means that we expect the shard to respond with the result to the coordiantor the query came from. (This is the case if we are doing a linearizable read)
+            self.update_database_and_respond(decided_commands).await;
         }
     }
 
@@ -186,20 +186,24 @@ impl OmniPaxosShard {
                 },
                 Phase::Commit => self.database.commit_command(command.command_id).await,
                 Phase::Abort => self.database.abort_command(command.command_id).await,
+                Phase::Execute => {
+                    error!("Execute commands should not be in the log");
+                    continue;
+                }
             };
             if command.coordinator_id == self.id {
                 if let Phase::Prepare = command.phase {
                     if let Some(sql_command) = command.sql_cmd.as_ref() {
                         if let QueryType::Insert = sql_command.query_type {
                             match response {
-                                Ok(_) => self.network.send_to_coordinator(ShardMessage::Ack(command.client_id, command.command_id)),
-                                Err(_) => self.network.send_to_coordinator(ShardMessage::Nack(command.client_id, command.command_id)),
+                                Ok(_) => self.network.send_to_coordinator(ShardMessage::Ack(command.command_id)),
+                                Err(_) => self.network.send_to_coordinator(ShardMessage::Nack(command.command_id)),
                             }
                             return;
                         }
                     }
                 }
-                self.network.send_to_coordinator(ShardMessage::Answer(command.client_id, command.command_id, response));
+                self.network.send_to_coordinator(ShardMessage::Answer(command.command_id, response));
             }
         }
     }
@@ -227,31 +231,38 @@ impl OmniPaxosShard {
         for message in messages.drain(..) {
             let command: Command;
             match message {
-                CoordinatorMessage::Prepare(client_id, cmd_id, sql_command) => {
-                    if let QueryType::Select = sql_command.query_type {
-                        self.handle_read_message(client_id, cmd_id, sql_command).await;
-                        return;
+                CoordinatorMessage::Execute(cmd_id, sql_command) => {
+                    if matches!(sql_command.query_type, QueryType::Select) {
+                        self.handle_read_message(cmd_id, sql_command).await;
                     }
+                    else {
+                        let response = self.database.execute_command(sql_command).await;
+                        let msg = ShardMessage::Answer(cmd_id, response);
+                        self.network.send_to_coordinator(msg);
+                    }
+                    return;
+                }
+                CoordinatorMessage::Prepare(cmd_id, sql_command) => {
                     command = Command {
-                        client_id: client_id,
+                        client_id: 0, // Shard does not care about clients, as coordinator tracks everything
                         coordinator_id: self.id,
                         command_id: cmd_id,
                         sql_cmd: Some(sql_command),
                         phase: Phase::Prepare,
                     }
                 },
-                CoordinatorMessage::Commit(client_id, cmd_id) => {
+                CoordinatorMessage::Commit(cmd_id) => {
                     command = Command {
-                        client_id: client_id,
+                        client_id: 0,
                         coordinator_id: self.id,
                         command_id: cmd_id,
                         sql_cmd: None,
                         phase: Phase::Commit,
                     }
                 },
-                CoordinatorMessage::Abort(client_id, cmd_id) => {
+                CoordinatorMessage::Abort(cmd_id) => {
                     command = Command {
-                        client_id: client_id,
+                        client_id: 0,
                         coordinator_id: self.id,
                         command_id: cmd_id,
                         sql_cmd: None,
@@ -265,12 +276,7 @@ impl OmniPaxosShard {
             }
     }
 
-    async fn handle_read_message(
-        &mut self,
-        client_id: ClientId,
-        command_id: CommandId,
-        sql_command: SqlCommand,
-    ) {
+    async fn handle_read_message(&mut self, command_id: CommandId, sql_command: SqlCommand) {
         match sql_command
             .consistency
             .clone()
@@ -278,33 +284,27 @@ impl OmniPaxosShard {
         {
             Consistency::Local => {
                 // Read from local DB directly
-                let response = self.database.prepare_command(sql_command, command_id).await;
-                let msg = ShardMessage::Answer(client_id, command_id, response);
+                let response = self.database.execute_command(sql_command).await;
+                let msg = ShardMessage::Answer(command_id, response);
                 self.network.send_to_coordinator(msg); // send response back to the coorinator the request came from
             }
             Consistency::Leader => {
                 if let Some((leader_id, is_accept_phase)) = self.omnipaxos.get_current_leader() {
                     if leader_id == self.id && is_accept_phase {
                         // We are the leader, process locally
-                        let response = self.database.prepare_command(sql_command, command_id).await;
-                        let msg = ShardMessage::Answer(client_id, command_id, response);
+                        let response = self.database.execute_command(sql_command).await;
+                        let msg = ShardMessage::Answer(command_id, response);
                         self.network.send_to_coordinator(msg);
                     } else {
                         // Forward to leader
-                        let forward_msg = ClusterMessage::ReadRequest(
-                            client_id,
-                            self.id,
-                            command_id,
-                            sql_command,
-                        );
+                        let forward_msg = ClusterMessage::ReadRequest(self.id, command_id, sql_command);
                         debug!("{}: Forwarding read request to leader {}", self.id, leader_id);
                         self.network.send_to_cluster(leader_id, forward_msg);
                     }
                 }
             }
             Consistency::Linearizable => {
-                // TODO: Approach without sharding does not work anymore
-                self.network.send_to_coordinator(ShardMessage::Answer(client_id, command_id, Err(DatabaseError{message: "Linearizable not implemented".to_string()})));
+                error!("Linearizable read is not directly executable. Has to be prepared first")
             }
         };
     }
