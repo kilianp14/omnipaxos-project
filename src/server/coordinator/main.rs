@@ -18,7 +18,7 @@ pub async fn main() {
         Err(e) => panic!("{e} while parsing coordinator config"),
     };
 
-    info!("Starting up coodinator: {}", server_config.local.server_id);    info!(
+    info!(
         "Starting up coordinator: {}, {}",
         server_config.local.server_id, server_config.local.listen_port
     );

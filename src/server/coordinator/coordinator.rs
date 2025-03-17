@@ -25,10 +25,10 @@ pub struct OmniPaxosCoordinator {
     config: OmniPaxosCoordinatorConfig,
     peers: Vec<NodeId>,
     shard_ranges: Vec<(Range<i64>, ShardId)>,
-    // Maps command id to timestemp for timeouts (still TODO), client, involved shards, and number of received acks
-    pending_transactions: HashMap<CommandId, (Timestamp, ClientId, Vec<ShardId>, usize)>,
-    // Maps command id to timestemp for timeouts (still TODO), client, number of expected acks, received answers
-    pending_executions: HashMap<CommandId, (Timestamp, ClientId, usize, Vec<Result<String, DatabaseError>>)>,
+    // Maps command id to client, involved shards, and received answers
+    pending_transactions: HashMap<CommandId, (ClientId, Vec<ShardId>, Vec<String>)>,
+    // Maps command id to client, number of expected acks, received answers
+    pending_executions: HashMap<CommandId, (ClientId, usize, Vec<Result<String, DatabaseError>>)>,
 }
 
 impl OmniPaxosCoordinator {
@@ -76,10 +76,6 @@ impl OmniPaxosCoordinator {
             tokio::select! {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
-                    match self.omnipaxos.get_current_leader() {
-                        Some(leader) => debug!("{}: Current Leader: {}, QC: {}", self.id, leader.0, leader.1),
-                        None => {}
-                    }
                     self.send_outgoing_msgs();
                 },
                 _ = self.network.recv_many(&mut cluster_msg_buf, &mut client_msg_buf, &mut shard_msg_buf, NETWORK_BATCH_SIZE) => {
@@ -173,61 +169,59 @@ impl OmniPaxosCoordinator {
                         shard_sql_commands = self.split_by_shard(sql_command);
                     }
                     if shard_sql_commands.is_empty() {
-                        self.network.send_to_client(client_id, ServerMessage::Answer(command_id, "All keys invalid".to_string()));
+                        self.network.send_to_client(client_id, ServerMessage::Answer(command_id.clone(), "All keys invalid".to_string()));
                         continue;
                     }
                     let shards_in_transaction = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| shard_id).collect();
-                    self.pending_transactions.insert(command_id, (Utc::now().timestamp_millis(), client_id, shards_in_transaction, 0));
+                    self.pending_transactions.insert(command_id.clone(), (client_id, shards_in_transaction, Vec::with_capacity(shard_sql_commands.len())));
                     if coordinator_id == self.id {
                         for (shard_id, sql_command) in shard_sql_commands {
-                            self.network.send_to_shard(shard_id, CoordinatorMessage{command: Command::Prepare(command_id, client_id, coordinator_id, sql_command)});
+                            self.network.send_to_shard(shard_id, CoordinatorMessage{command: Command::Prepare(command_id.clone(), client_id, coordinator_id, sql_command)});
                         }
                     }
                 },
                 Command::Commit(command_id, coordinator_id) => {
-                    if coordinator_id == self.id {
-                        if let Some((_, _, involved_shards, _)) = self.pending_transactions.get(&command_id) {
+                    if let Some((client_id, involved_shards, answers)) = self.pending_transactions.get(&command_id.clone()) {
+                        if coordinator_id == self.id {
                             for shard_id in involved_shards {
-                                self.network.send_to_shard(*shard_id, CoordinatorMessage{command: Command::Commit(command_id, coordinator_id)});
+                                self.network.send_to_shard(*shard_id, CoordinatorMessage{command: Command::Commit(command_id.clone(), coordinator_id)});
                             }
+                            self.network.send_to_client(*client_id, ServerMessage::Answer(command_id.clone(), answers.join(",")));
                         }
-                        else {
-                            error!("Command to be committed that is not in pending transactions");
-                            continue;
-                        }
+                        self.pending_transactions.remove(&command_id);
                     }
-                    self.pending_transactions.remove(&command_id);
+                    else {
+                        error!("Command to be committed that is not in pending transactions");
+                        continue;
+                    }
                 },
                 Command::Abort(command_id, coordinator_id) => {
                     if coordinator_id == self.id {
-                        if let Some((_, _, involved_shards, _)) = self.pending_transactions.get(&command_id) {
+                        if let Some((_, involved_shards, _)) = self.pending_transactions.get(&command_id.clone()) {
                             for shard_id in involved_shards {
-                                self.network.send_to_shard(*shard_id, CoordinatorMessage{command: Command::Abort(command_id, coordinator_id)});
+                                self.network.send_to_shard(*shard_id, CoordinatorMessage{command: Command::Abort(command_id.clone(), coordinator_id)});
                             }
-                        }
-                        else {
-                            error!("Command to be aborted that is not in pending transactions");
-                            continue;
                         }
                     }
                     self.pending_transactions.remove(&command_id);
                 },
-                Command::Ack(command_id, coordinator_id) => {
-                    if let Some((_, _, involved_shards, mut number_of_acks)) = self.pending_transactions.get_mut(&command_id) {
-                        number_of_acks += 1;
-                        if number_of_acks == involved_shards.len() && self.id == coordinator_id {
+                Command::Ack(command_id, coordinator_id, answer) => {
+                    if let Some((_, involved_shards, answers)) = self.pending_transactions.get_mut(&command_id) {
+                        answers.push(answer);
+                        if answers.len() == involved_shards.len() && self.id == coordinator_id {
+                            debug!("Command can be committed");
                             self.omnipaxos
-                            .append(Command::Commit(command_id, self.id))
-                            .expect("Append to Omnipaxos log failed");
+                                .append(Command::Commit(command_id, self.id))
+                                .expect("Append to Omnipaxos log failed");
                         }
                     }
                 }
                 Command::Nack(command_id, coordinator_id) => {
-                    if let Some((_, _, _, _)) = self.pending_transactions.get(&command_id) {
+                    if let Some((_, _, _)) = self.pending_transactions.get(&command_id) {
                         if self.id == coordinator_id {
                             self.omnipaxos
-                            .append(Command::Abort(command_id, self.id))
-                            .expect("Append to Omnipaxos log failed");
+                                .append(Command::Abort(command_id, self.id))
+                                .expect("Append to Omnipaxos log failed");
                         }
                     }
                 }
@@ -256,12 +250,12 @@ impl OmniPaxosCoordinator {
                     if matches!(sql_command.query_type, QueryType::Select) && matches!(sql_command.consistency, Some(Consistency::Leader) | Some(Consistency::Local)) {
                         let shard_sql_commands = self.split_by_shard(sql_command);
                         if shard_sql_commands.is_empty() {
-                            self.network.send_to_client(from,  ServerMessage::Answer(command_id, "All keys invalid".to_string()));
+                            self.network.send_to_client(from,  ServerMessage::Answer(command_id.clone(), "All keys invalid".to_string()));
                             continue;
                         }
-                        self.pending_executions.insert(command_id, (Utc::now().timestamp_millis(), from, shard_sql_commands.len(), Vec::with_capacity(shard_sql_commands.len())));
+                        self.pending_executions.insert(command_id.clone(), (from, shard_sql_commands.len(), Vec::with_capacity(shard_sql_commands.len())));
                         for (shard_id, shard_sql) in shard_sql_commands {
-                            self.network.send_to_shard(shard_id, CoordinatorMessage{command: Command::Execute(command_id, shard_sql)});
+                            self.network.send_to_shard(shard_id, CoordinatorMessage{command: Command::Execute(command_id.clone(), shard_sql)});
                         }
                     }
                     else {
@@ -299,9 +293,10 @@ impl OmniPaxosCoordinator {
     async fn handle_shard_messages(&mut self, messages: &mut Vec<(ShardId, ShardMessage)>) {
         for (from, message) in messages.drain(..){
             match message {
-                ShardMessage::Ack(command_id) => {
+                ShardMessage::Ack(command_id, res) => {
+                    debug!("Coordinator received acknowledgement from shard {}", from);
                     self.omnipaxos
-                        .append(Command::Ack(command_id, from))
+                        .append(Command::Ack(command_id, from, res))
                         .expect("Append to omnipaxos log failed")
                 }
                 ShardMessage::Nack(command_id) => {
@@ -312,7 +307,7 @@ impl OmniPaxosCoordinator {
                 ShardMessage::Answer(command_id, result) => {
                     let execution = self.pending_executions.get_mut(&command_id);
                     match execution {
-                        Some((_, client_id, expected_acks, results)) => {
+                        Some((client_id, expected_acks, results)) => {
                             results.push(result);
                             if results.len() == *expected_acks {
                                 let mut response: String = String::new();
@@ -325,7 +320,7 @@ impl OmniPaxosCoordinator {
                                         }
                                     }
                                 }
-                                self.network.send_to_client(*client_id, ServerMessage::Answer(command_id, response));
+                                self.network.send_to_client(*client_id, ServerMessage::Answer(command_id.clone(), response));
                                 self.pending_executions.remove(&command_id);
                             }
                         }
@@ -353,36 +348,66 @@ impl OmniPaxosCoordinator {
     }
 
     fn split_by_shard(&self, sql_command: SqlCommand) -> Vec<(ShardId, SqlCommand)> {
-        if let (Some(all_keys), Some(all_values)) = (sql_command.keys.clone(), sql_command.values.clone()){
-            let mut shard_map: HashMap<ShardId, (Vec<i64>, Vec<Vec<String>>)> = HashMap::new();
-
-            for (key, value) in all_keys.into_iter().zip(all_values.into_iter()) {
-                if let Some(shard_id) = self.find_shard_for_key(key) {
+        if let Some(all_keys) = sql_command.keys.clone() {
+            match sql_command.values.clone() {
+                None => {
+                    let mut shard_map: HashMap<ShardId, Vec<i64>> = HashMap::new();
+                    for key in all_keys {
+                        if let Some(shard_id) = self.find_shard_for_key(key) {
+                            shard_map
+                                .entry(*shard_id)
+                                .or_insert_with(|| Vec::new())
+                                .push(key.clone());
+                        }
+                    }
                     shard_map
-                        .entry(*shard_id)
-                        .or_insert_with(|| (Vec::new(), Vec::new()))
-                        .0
-                        .push(key.clone());
-                    shard_map.get_mut(&shard_id).unwrap().1.push(value.clone());
+                        .into_iter()
+                        .map(|(shard_id, keys)| {
+                            (
+                                shard_id,
+                                SqlCommand {
+                                    query_type: sql_command.query_type.clone(),
+                                    table: sql_command.table.clone(),
+                                    columns: sql_command.columns.clone(),
+                                    keys: Some(keys),
+                                    values: None,
+                                    consistency: sql_command.consistency.clone(),
+                                },
+                            )
+                        })
+                        .collect()
+                }
+                Some(all_values) => {
+                    let mut shard_map: HashMap<ShardId, (Vec<i64>, Vec<Vec<String>>)> = HashMap::new();
+                    for (key, value) in all_keys.into_iter().zip(all_values.into_iter()) {
+                        if let Some(shard_id) = self.find_shard_for_key(key) {
+                            shard_map
+                                .entry(*shard_id)
+                                .or_insert_with(|| (Vec::new(), Vec::new()))
+                                .0
+                                .push(key.clone());
+                            shard_map.get_mut(&shard_id).unwrap().1.push(value.clone());
+                        }
+                    }
+            
+                    shard_map
+                        .into_iter()
+                        .map(|(shard_id, (keys, values))| {
+                            (
+                                shard_id,
+                                SqlCommand {
+                                    query_type: sql_command.query_type.clone(),
+                                    table: sql_command.table.clone(),
+                                    columns: sql_command.columns.clone(),
+                                    keys: Some(keys),
+                                    values: Some(values),
+                                    consistency: sql_command.consistency.clone(),
+                                },
+                            )
+                        })
+                        .collect()
                 }
             }
-    
-            shard_map
-                .into_iter()
-                .map(|(shard_id, (keys, values))| {
-                    (
-                        shard_id,
-                        SqlCommand {
-                            query_type: sql_command.query_type.clone(),
-                            table: sql_command.table.clone(),
-                            columns: sql_command.columns.clone(),
-                            keys: Some(keys),
-                            values: Some(values),
-                            consistency: sql_command.consistency.clone(),
-                        },
-                    )
-                })
-                .collect()
         }
         else {
             return Vec::new();

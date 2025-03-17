@@ -1,5 +1,5 @@
 location = "local-5"
-server_id = 1
+server_id = 2
 shard_id = 1
 listen_address = "127.0.0.1"
 listen_port = 10005

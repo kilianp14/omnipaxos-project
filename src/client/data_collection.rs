@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write};
+use std::{fs::File, io::Write, collections::HashMap};
 
 use crate::configs::ClientConfig;
 use chrono::Utc;
@@ -12,7 +12,6 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize, Clone)]
 struct RequestData {
-    command_id: CommandId,
     request_time: Timestamp,
     response_time: Option<Timestamp>,
     consistency: Option<Consistency>,
@@ -22,14 +21,14 @@ struct RequestData {
 }
 
 pub struct ClientData {
-    request_data: Vec<RequestData>,
+    request_data: HashMap<CommandId, RequestData>,
     response_count: usize,
 }
 
 impl ClientData {
     pub fn new() -> Self {
         ClientData {
-            request_data: Vec::new(),
+            request_data: HashMap::new(),
             response_count: 0,
         }
     }
@@ -53,20 +52,21 @@ impl ClientData {
         let data = RequestData {
             request_time: Utc::now().timestamp_millis(),
             query_type: command.query_type,
-            command_id,
             request_value: values,
             consistency: command.consistency,
             response_value: None,
             response_time: None,
         };
-        self.request_data.push(data);
+        self.request_data.insert(command_id, data);
     }
 
     pub fn new_response(&mut self, command_id: CommandId, response: String) {
-        let response_time = Utc::now().timestamp_millis();
-        self.request_data[command_id].response_time = Some(response_time);
-        self.request_data[command_id].response_value = Some(response);
-        self.response_count += 1;
+        let time = Utc::now().timestamp_millis();
+        if let Some(data) = self.request_data.get_mut(&command_id) {
+            data.response_time = Some(time);
+            data.response_value = Some(response);
+            self.response_count += 1;
+        }
     }
 
     pub fn response_count(&self) -> usize {

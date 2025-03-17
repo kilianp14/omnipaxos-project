@@ -27,7 +27,7 @@ use crate::network::NetworkTrait;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerAnswer {
     ServerMessage(ServerMessage),
-    Decide(NodeId, ClusterMessage),
+    Decide(NodeId, NodeId, ShardId, ClusterMessage),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +39,7 @@ pub enum TesterMessage {
 }
 
 pub struct NetworkTest {
+    node_id: NodeId,
     peers: Vec<NodeId>,
     shards: Vec<ShardId>,
     peer_connections: Vec<Option<PeerConnection>>,
@@ -98,7 +99,7 @@ impl NetworkTrait for NetworkTest {
         )) = msg {
             match &mut self.tester_connection {
                 Some(ref mut connection) => {
-                    if let Err(err) = connection.send(ServerAnswer::Decide(node_id, msg)) {
+                    if let Err(err) = connection.send(ServerAnswer::Decide(self.node_id, node_id, 0, msg)) {
                         warn!("Couldn't send msg to tester: {err}");
                         self.tester_connection = None;
                     }
@@ -223,7 +224,6 @@ impl NetworkTest {
             .shards
             .into_iter()
             .zip(shard_addresses.into_iter())
-            .filter(|(node_id, _addr)| *node_id != id)
             .collect();
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peer_addresses.len(), Default::default);
@@ -233,6 +233,7 @@ impl NetworkTest {
         let (shard_message_sender, shard_messages) = tokio::sync::mpsc::channel(batch_size);
         let (tester_message_sender, tester_messages) = tokio::sync::mpsc::channel(batch_size);
         let mut network = Self {
+            node_id: config.local.server_id,
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             shards: shard_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
@@ -280,7 +281,7 @@ impl NetworkTest {
                 }
             }
             let tester_connected = self.tester_connection.is_some();
-            let all_shards_connected = self.shard_connections.len() >= self.shards.len();
+            let all_shards_connected = self.shard_connections.iter().all(|c| c.is_some());
             let all_cluster_connected = self.peer_connections.iter().all(|c| c.is_some());
             if tester_connected && all_cluster_connected && all_shards_connected {
                 listener_handle.abort();

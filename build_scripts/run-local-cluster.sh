@@ -8,7 +8,7 @@ rust_log="info"
 # Clean up child processes
 interrupt() {
     pkill -P $$
-    psql -U postgres -d postgres -t -c "SELECT datname FROM pg_database WHERE datname LIKE 'omnipaxos_tempdb%';" | xargs -I{} psql -U postgres -d postgres -c "DROP DATABASE \"{}\";"
+    ./clear_db.sh
 }
 trap "interrupt" SIGINT
 

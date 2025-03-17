@@ -1,4 +1,4 @@
-use omnipaxos_sql::common::{sql::{QueryType, SqlCommand, CommandId}, messages::DatabaseError};
+use omnipaxos_sql::common::{sql::{QueryType, SqlCommand, CommandId, ShardId, NodeId}, messages::DatabaseError};
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -35,31 +35,35 @@ impl Database {
         Database { pool: temp_pool }
     }
 
-    pub async fn commit_command(&self, transaction_id: CommandId) -> Result<String, DatabaseError> {
-        let commit_query = format!("COMMIT PREPARED '{}'", transaction_id);
+    pub async fn commit_command(&self, transaction_id: CommandId, node_id: NodeId, shard_id: ShardId) -> Result<String, DatabaseError> {
+        let commit_query = format!("COMMIT PREPARED '{}_{}_{}'", transaction_id, node_id, shard_id);
         sqlx::query(&commit_query).execute(&self.pool).await?;
     
         Ok(format!("Committed Transaction {}", transaction_id))
     }
     
-    pub async fn abort_command(&self, transaction_id: CommandId) -> Result<String, DatabaseError> {
-        let abort_query = format!("ROLLBACK PREPARED '{}'", transaction_id);
+    pub async fn abort_command(&self, transaction_id: CommandId, node_id: NodeId, shard_id: ShardId) -> Result<String, DatabaseError> {
+        let abort_query = format!("ROLLBACK PREPARED '{}_{}_{}'", transaction_id, node_id, shard_id);
         sqlx::query(&abort_query).execute(&self.pool).await?;
     
         Ok(format!("Aborted Transaction {}", transaction_id))
     }
 
-    pub async  fn prepare_command(&self, command: SqlCommand, id: CommandId) -> Result<String, DatabaseError> {
+    pub async fn prepare_command(
+        &self, command: SqlCommand, transaction_id: CommandId, node_id: NodeId, shard_id: ShardId
+    ) -> Result<String, DatabaseError> {
         // Begin the transaction
         sqlx::query("BEGIN").execute(&self.pool).await?;
 
         let result = self.execute_command(command).await;
         match result {
             Ok(message) => {
-                let prepare_query = format!("PREPARE TRANSACTION '{}'", id);
+                // Node and Shard id is needed here because otherwise we use the same global transaction id for all databases
+                // This causes issues if running in a local cluster
+                let prepare_query = format!("PREPARE TRANSACTION '{}_{}_{}'", transaction_id, node_id, shard_id);
                 sqlx::query(&prepare_query).execute(&self.pool).await?;
             
-                Ok(format!("Prepared transaction '{}': {}", id, message))
+                Ok(format!("{}", message))
             },
             Err(err) => Err(err)
         }
@@ -90,11 +94,11 @@ impl Database {
         };
     
         let query_str = format!(
-            "SELECT {} FROM \"{}\" WHERE \"key\" = ANY($1)",
-            columns, command.table
+            "SELECT {} FROM \"{}\" WHERE \"{}\" = ANY($1)",
+            columns, command.table, command.columns[0].0
         );
     
-        let rows: Vec<(String,)> = sqlx::query_as(&query_str)
+        let rows: Vec<(i64,)> = sqlx::query_as(&query_str)
             .bind(command.keys.unwrap())
             .fetch_all(&self.pool)
             .await?;
@@ -105,7 +109,7 @@ impl Database {
     
         let result = rows
             .into_iter()
-            .map(|(value,)| value)
+            .map(|(value,)| value.to_string())
             .collect::<Vec<String>>()
             .join(", ");
     
@@ -117,6 +121,13 @@ impl Database {
             Some(v) if !v.is_empty() => v,
             _ => return Err(DatabaseError{message: "No values provided for insertion.".to_string()}),
         };
+        let keys = match command.keys.clone() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Err(DatabaseError{message: "No keys provided for insertion.".to_string()}),
+        };
+        if keys.len() != values.len() {
+            return Err(DatabaseError{message: "Different amount of keys and values".to_string()})
+        }
     
         let columns: Vec<String> = command
             .columns
@@ -129,19 +140,19 @@ impl Database {
             "INSERT INTO \"{}\" ({}) VALUES ({})",
             command.table,
             columns_str,
-            values[0]
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("${}", i + 1))
+            (0..=values[0].len())
+                .map(|i| format!("${}", i + 1))
                 .collect::<Vec<String>>()
                 .join(", ")
         );
-    
-        for row in values.iter() {
-            sqlx::query(&insert_query)
-                .bind(row.clone())
-                .execute(&self.pool)
-                .await?;
+        
+        for (key, row) in keys.iter().zip(values.iter()) {
+            let mut query = sqlx::query(&insert_query);
+            query = query.bind(key);
+            for value in row {
+                query = query.bind(value);
+            }
+            query.execute(&self.pool).await?;
         }
         Ok(format!("Inserted {} rows", values.len()))
     }

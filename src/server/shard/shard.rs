@@ -18,6 +18,7 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct OmniPaxosShard {
     id: NodeId,
+    shard_id: ShardId,
     network: Box<dyn NetworkTrait>,
     database: Arc<Database>,
     omnipaxos: OmniPaxosInstance,
@@ -38,6 +39,7 @@ impl OmniPaxosShard {
 
         OmniPaxosShard {
             id: config.local.server_id,
+            shard_id: config.local.shard_id,
             network,
             database,
             omnipaxos,
@@ -63,10 +65,6 @@ impl OmniPaxosShard {
             tokio::select! {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
-                    match self.omnipaxos.get_current_leader() {
-                        Some(leader) => debug!("{}: Current Leader: {}, QC: {}", self.id, leader.0, leader.1),
-                        None => {}
-                    }
                     self.send_outgoing_msgs();
                 },
                 _ = self.network.recv_many(&mut cluster_msg_buf, &mut coordinator_msg_buf, NETWORK_BATCH_SIZE) => {
@@ -176,26 +174,28 @@ impl OmniPaxosShard {
         for command in commands {
             match command {
                 Command::Prepare(command_id, _, coordinator_id, sql_command) => {
-                    let response = self.database.prepare_command(sql_command, command_id).await;
+                    let response = self.database.prepare_command(sql_command, command_id.clone(), self.id, self.shard_id).await;
                     if coordinator_id == self.id {
                         match response {
-                            Ok(_) => self.network.send_to_coordinator(ShardMessage::Ack(command_id)),
+                            Ok(res) => {
+                                debug!("Command {} prepared successfully in shard {}", command_id, self.shard_id);
+                                self.network.send_to_coordinator(ShardMessage::Ack(command_id, res))
+                            }
                             // TODO: Proper error handling
-                            Err(_) => self.network.send_to_coordinator(ShardMessage::Nack(command_id)),
+                            Err(err) => {
+                                warn!("Preparing transaction failed: {}", err.message);
+                                self.network.send_to_coordinator(ShardMessage::Nack(command_id))
+                            }
                         }
                     }
                 }
-                Command::Commit(command_id, coordinator_id) => {
-                    let response = self.database.commit_command(command_id).await;
-                    if coordinator_id == self.id {
-                        self.network.send_to_coordinator(ShardMessage::Answer(command_id, response));
-                    }
+                Command::Commit(command_id, _) => {
+                    // TODO: Proper error handling
+                    let _ = self.database.commit_command(command_id.clone(), self.id, self.shard_id).await;
                 }
-                Command::Abort(command_id, coordinator_id) => {
-                    let response = self.database.abort_command(command_id).await;
-                    if coordinator_id == self.id {
-                        self.network.send_to_coordinator(ShardMessage::Answer(command_id, response));
-                    }
+                Command::Abort(command_id, _) => {
+                    // TODO: Proper error handling
+                    let _ = self.database.abort_command(command_id.clone(), self.id, self.shard_id).await;
                 }
                 _ => {
                     error!("Weird message in the shard log");

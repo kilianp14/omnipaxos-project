@@ -34,3 +34,7 @@ path = "src/server/coordinator/main.rs"
 [[bin]]
 name = "shard"
 path = "src/server/shard/main.rs"
+
+[[bin]]
+name = "tester"
+path = "src/tester/main.rs"

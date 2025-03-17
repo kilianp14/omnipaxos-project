@@ -3,8 +3,10 @@ use chrono::Utc;
 use log::*;
 use omnipaxos_sql::common::{messages::*, sql::*};
 use rand::{rngs::ThreadRng, Rng};
-use std::time::Duration;
+use core::time;
+use std::{time::Duration, thread::sleep};
 use tokio::time::interval;
+use uuid::Uuid;
 
 const NETWORK_BATCH_SIZE: usize = 100;
 
@@ -26,6 +28,7 @@ impl Client {
             NETWORK_BATCH_SIZE,
         ).await;
         let rng = rand::thread_rng();
+        let next_request_id = config.server_id as i64;
         Client {
             id: config.server_id,
             network,
@@ -33,7 +36,7 @@ impl Client {
             active_server: config.server_id,
             config,
             final_request_count: None,
-            next_request_id: 0,
+            next_request_id: next_request_id,
             rng,
         }
     }
@@ -47,7 +50,10 @@ impl Client {
             }
             _ => panic!("Error waiting for start signal"),
         }
-        self.send_request(QueryType::Create).await;
+        if self.id == 1 {
+            self.send_request(QueryType::Create).await;
+        }
+        sleep(time::Duration::from_secs(5));
         // Early end
         let intervals = self.config.requests.clone();
         if intervals.is_empty() {
@@ -124,10 +130,10 @@ impl Client {
 
     async fn send_request(&mut self, query_type: QueryType) {
         // Prevent subtract overflow
-        let prev_key = if self.next_request_id == 0 {
-            0
+        let prev_key = if self.next_request_id == self.id as i64{
+            self.id as i64
         } else {
-            self.next_request_id - 1
+            self.next_request_id - 2
         };
         let key = self.next_request_id;
         let cmd = match query_type {
@@ -153,12 +159,13 @@ impl Client {
                 }
             }
         };
-        let request = ClientMessage::Handle(self.next_request_id.try_into().unwrap(), cmd.clone());
+        let unique_command_id = Uuid::new_v4();
+        let request = ClientMessage::Handle(unique_command_id.try_into().unwrap(), cmd.clone());
         debug!("Sending {request:?}");
         self.network.send(self.active_server, request).await;
         self.client_data
-            .new_request(cmd, self.next_request_id.try_into().unwrap());
-        self.next_request_id += 1;
+            .new_request(cmd, Uuid::new_v4().to_string());
+        self.next_request_id += 2;
     }
 
     fn run_finished(&self) -> bool {

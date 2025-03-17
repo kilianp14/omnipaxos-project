@@ -33,7 +33,7 @@ impl ClientConfig {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct RequestInterval {
     pub duration_sec: u64,
-    pub requests_per_sec: u64,
+    pub requests_per_sec: f64,
     pub read_ratio: f64,
 }
 
@@ -47,11 +47,11 @@ impl RequestInterval {
     }
 
     pub fn get_request_delay(&self) -> Duration {
-        if self.requests_per_sec == 0 {
+        if self.requests_per_sec == 0.0 {
             return Duration::from_secs(999999);
         }
-        let delay_ms = 1000 / self.requests_per_sec;
-        assert!(delay_ms != 0);
-        Duration::from_millis(delay_ms)
+        let delay_ms = 1000.0 / self.requests_per_sec;
+        assert!(delay_ms != 0.0);
+        Duration::from_millis(delay_ms as u64)
     }
 }

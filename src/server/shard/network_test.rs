@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use log::*;
 use omnipaxos_sql::common::{
     messages::*,
-    sql::NodeId,
+    sql::{NodeId, ShardId},
     utils::*,
 };
 use omnipaxos::messages::{Message, sequence_paxos::{PaxosMessage, PaxosMsg, Decide}};
@@ -24,7 +24,7 @@ use omnipaxos_sql::server::configs::OmniPaxosShardConfig;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerAnswer {
     ServerMessage(ServerMessage),
-    Decide(NodeId, ClusterMessage),
+    Decide(NodeId, NodeId, ShardId, ClusterMessage),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +36,8 @@ pub enum TesterMessage {
 }
 
 pub struct NetworkTest {
+    node_id: NodeId,
+    shard_id: ShardId,
     peers: Vec<NodeId>,
     peer_connections: Vec<Option<PeerConnection>>,
     coordinator_connection: Option<CoordinatorConnection>,
@@ -83,7 +85,7 @@ impl NetworkTrait for NetworkTest {
         )) = msg {
             match &mut self.tester_connection {
                 Some(ref mut connection) => {
-                    if let Err(err) = connection.send(ServerAnswer::Decide(node_id, msg)) {
+                    if let Err(err) = connection.send(ServerAnswer::Decide(self.node_id, node_id, self.shard_id, msg)) {
                         warn!("Couldn't send msg to tester: {err}");
                         self.tester_connection = None;
                     }
@@ -191,6 +193,8 @@ impl NetworkTest {
         let (coordinator_message_sender, coordinator_messages) = tokio::sync::mpsc::channel(batch_size);
         let (tester_message_sender, tester_messages) = tokio::sync::mpsc::channel(batch_size);
         let mut network = Self {
+            node_id: config.local.server_id,
+            shard_id: config.local.shard_id,
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
             coordinator_connection: None,

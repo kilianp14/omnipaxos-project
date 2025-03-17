@@ -52,7 +52,7 @@ pub mod messages {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ShardMessage {
-        Ack(CommandId),
+        Ack(CommandId, String),
         Nack(CommandId),
         Answer(CommandId, Result<String, DatabaseError>),
     }
@@ -60,7 +60,7 @@ pub mod messages {
     impl ServerMessage {
         pub fn command_id(&self) -> (CommandId, String) {
             match self {
-                ServerMessage::Answer(id, s) => (*id, s.clone()),
+                ServerMessage::Answer(id, s) => (id.clone(), s.clone()),
                 ServerMessage::StartSignal(_) => unimplemented!(),
             }
         }
@@ -74,7 +74,7 @@ pub mod sql {
     use omnipaxos::macros::Entry;
     use serde::{Deserialize, Serialize};
 
-    pub type CommandId = usize;
+    pub type CommandId = String;
     pub type ClientId = u64;
     pub type ShardId = u64;
     pub type NodeId = omnipaxos::util::NodeId;
@@ -84,7 +84,7 @@ pub mod sql {
     pub enum Command {
         Execute(CommandId, SqlCommand),
         Prepare(CommandId, ClientId, NodeId, SqlCommand),
-        Ack(CommandId, ShardId),
+        Ack(CommandId, ShardId, String),
         Nack(CommandId, ShardId),
         Commit(CommandId, NodeId),
         Abort(CommandId, NodeId),

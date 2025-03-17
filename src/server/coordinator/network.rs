@@ -230,7 +230,7 @@ impl Network {
                 }
             }
             let all_clients_connected = self.client_connections.len() >= num_clients;
-            let all_shards_connected = self.shard_connections.len() >= self.shards.len();
+            let all_shards_connected = self.shard_connections.iter().all(|c| c.is_some());
             let all_cluster_connected = self.peer_connections.iter().all(|c| c.is_some());
             if all_clients_connected && all_cluster_connected && all_shards_connected {
                 listener_handle.abort();
