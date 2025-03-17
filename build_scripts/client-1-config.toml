@@ -1,6 +1,6 @@
 location = "local-1"
 server_id = 1 # the server to connect to
-server_address = "127.0.0.1:8001"
+server_address = "127.0.0.1:10001"
 summary_filepath = "./logs/client-1.json"
 output_filepath = "./logs/client-1.csv"
 

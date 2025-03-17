@@ -11,7 +11,7 @@ RUN cargo install cargo-chef
 WORKDIR /app
 
 FROM chef AS planner
-COPY . .
+COPY Cargo.toml Cargo.lock ./
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -19,12 +19,14 @@ COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies - this is the caching Docker layer!
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Build application
-COPY . .
-RUN cargo build --release --bin coordinator
+# Copy source files separately to optimize caching
+COPY Cargo.toml Cargo.lock ./
+RUN cargo fetch --locked  # Pre-fetch dependencies
+COPY src ./src
+RUN cargo build --release --bin shard
 
 FROM debian:bookworm-slim AS runtime
-    
+
 # Install dependencies
 RUN apt-get update && apt-get install -y \
     postgresql \
@@ -40,9 +42,8 @@ RUN echo "local all all trust" > /etc/postgresql/15/main/pg_hba.conf && \
 
 RUN sed -i 's/^max_prepared_transactions = 0/max_prepared_transactions = 100/' /etc/postgresql/15/main/postgresql.conf
 
-WORKDIR /app    
-COPY --from=builder /app/target/release/coordinator /usr/local/bin
-EXPOSE 5432 8000
+WORKDIR /app
+COPY --from=builder /app/target/release/shard /usr/local/bin
 
 # Did this as I coudn't copy a file `entrypoint.sh` into the `usr/local/bin` directory.
 COPY <<EOF /usr/local/bin/entrypoint.sh
@@ -58,9 +59,10 @@ until pg_isready -U postgres; do
 done
 
 # Run the Rust server
-exec /usr/local/bin/server
+exec /usr/local/bin/shard
 EOF
 
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+EXPOSE 5432 8000
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

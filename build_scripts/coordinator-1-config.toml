@@ -1,6 +1,6 @@
 location = "local-1"
 server_id = 1
-num_clients = 0 # Hardcoded number of client connections to wait for
+num_clients = 1 # Hardcoded number of client connections to wait for
 listen_address = "127.0.0.1"
 listen_port = 10001
 shards = [1, 2]

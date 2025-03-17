@@ -2,158 +2,189 @@ x-common-variables: &common-server-variables
   RUST_LOG: "INFO"
   SERVER_CONFIG_FILE: "/app/server-config.toml"
   CLUSTER_CONFIG_FILE: "/app/cluster-config.toml"
-  OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000" # Overwrite node_addrs in cluster config TOML
+  #  OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000" # Overwrite node_addrs in cluster config TOML
   OMNIPAXOS_LISTEN_ADDRESS: "0.0.0.0"             # Overwrite listen_address in server config TOMLs
   OMNIPAXOS_LISTEN_PORT: 8000                     # Overwrite listen_port in server config TOMLs
 
 services:
+  # Coordinators
   c1:
     image: omnipaxos-coordinator
+    container_name: c1
     build:
       context: ./..
       dockerfile: coordinator.dockerfile
-    container_name: c1
     networks:
       - backend
     environment:
       <<: *common-server-variables
+#      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000, sh11:8000,sh12:8000,sh13:8000, sh21:8000,sh22:8000,sh23:8000"
+      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000"
     volumes:
       - ./coordinator-1-config.toml:/app/server-config.toml
       - ./coordinator-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
   c2:
     image: omnipaxos-coordinator
+    container_name: c2
     build:
       context: ./..
       dockerfile: coordinator.dockerfile
-    container_name: c2
     networks:
       - backend
     environment:
       <<: *common-server-variables
+#      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000, sh11:8000,sh12:8000,sh13:8000, sh21:8000,sh22:8000,sh23:8000"
+      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000"
     volumes:
       - ./coordinator-2-config.toml:/app/server-config.toml
       - ./coordinator-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
   c3:
     image: omnipaxos-coordinator
+    container_name: c3
     build:
       context: ./..
       dockerfile: coordinator.dockerfile
-    container_name: c3
     networks:
       - backend
     environment:
       <<: *common-server-variables
+#      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000, sh11:8000,sh12:8000,sh13:8000, sh21:8000,sh22:8000,sh23:8000"
+      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000"
     volumes:
       - ./coordinator-3-config.toml:/app/server-config.toml
       - ./coordinator-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
+  # Shards Group 1 (first shard of each partition)
   sh11:
     image: omnipaxos-shard
+    container_name: sh11
     build:
       context: ./..
       dockerfile: shard.dockerfile
-    container_name: sh11
     networks:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_NODE_ADDRS: "sh11:8000,sh12:8000,sh13:8000"
     volumes:
       - ./shard1-1-config.toml:/app/server-config.toml
       - ./shard1-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
   sh12:
     image: omnipaxos-shard
+    container_name: sh12
     build:
       context: ./..
       dockerfile: shard.dockerfile
-    container_name: sh12
     networks:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_NODE_ADDRS: "sh11:8000,sh12:8000,sh13:8000"
     volumes:
       - ./shard1-2-config.toml:/app/server-config.toml
       - ./shard1-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
   sh13:
     image: omnipaxos-shard
+    container_name: sh13
     build:
       context: ./..
       dockerfile: shard.dockerfile
-    container_name: sh13
     networks:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_NODE_ADDRS: "sh11:8000,sh12:8000,sh13:8000"
     volumes:
       - ./shard1-3-config.toml:/app/server-config.toml
       - ./shard1-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
+  # Shards Group 2 (second shard of each partition)
   sh21:
     image: omnipaxos-shard
+    container_name: sh21
     build:
       context: ./..
       dockerfile: shard.dockerfile
-    container_name: sh21
     networks:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_NODE_ADDRS: "sh21:8000,sh22:8000,sh23:8000"
     volumes:
       - ./shard2-1-config.toml:/app/server-config.toml
       - ./shard2-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
   sh22:
     image: omnipaxos-shard
+    container_name: sh22
     build:
       context: ./..
       dockerfile: shard.dockerfile
-    container_name: sh22
     networks:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_NODE_ADDRS: "sh21:8000,sh22:8000,sh23:8000"
     volumes:
       - ./shard2-2-config.toml:/app/server-config.toml
       - ./shard2-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
   sh23:
     image: omnipaxos-shard
+    container_name: sh23
     build:
       context: ./..
       dockerfile: shard.dockerfile
-    container_name: sh23
     networks:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_NODE_ADDRS: "sh21:8000,sh22:8000,sh23:8000"
     volumes:
       - ./shard2-3-config.toml:/app/server-config.toml
       - ./shard2-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
+
+  # Clients
   cl1:
     image: omnipaxos-client
     container_name: cl1
+    build:
+      context: ./..
+      dockerfile: client.dockerfile
     networks:
       - backend
     environment:
       RUST_LOG: "debug"
       CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s1:8000" # Overwrite server_address in client config TOML
+      OMNIPAXOS_SERVER_ADDRESS: "c1:8000"
     volumes:
       - ./client-1-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/
+
   cl2:
     image: omnipaxos-client
     container_name: cl2
+    build:
+      context: ./..
+      dockerfile: client.dockerfile
     networks:
       - backend
     environment:
       RUST_LOG: "debug"
       CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
+      OMNIPAXOS_SERVER_ADDRESS: "c2:8000"
     volumes:
       - ./client-2-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/
