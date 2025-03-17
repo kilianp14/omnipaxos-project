@@ -2,7 +2,7 @@ use crate::{configs::ClientConfig, data_collection::ClientData, network::Network
 use chrono::Utc;
 use log::*;
 use omnipaxos_sql::common::{messages::*, sql::*};
-use rand::Rng;
+use rand::{rngs::ThreadRng, Rng};
 use std::time::Duration;
 use tokio::time::interval;
 
@@ -15,7 +15,8 @@ pub struct Client {
     config: ClientConfig,
     active_server: NodeId,
     final_request_count: Option<usize>,
-    next_request_id: usize,
+    next_request_id: i64,
+    rng: ThreadRng,
 }
 
 impl Client {
@@ -23,8 +24,8 @@ impl Client {
         let network = Network::new(
             vec![(config.server_id, config.server_address.clone())],
             NETWORK_BATCH_SIZE,
-        )
-        .await;
+        ).await;
+        let rng = rand::thread_rng();
         Client {
             id: config.server_id,
             network,
@@ -33,6 +34,7 @@ impl Client {
             config,
             final_request_count: None,
             next_request_id: 0,
+            rng,
         }
     }
 
@@ -54,7 +56,6 @@ impl Client {
         }
 
         // Initialize intervals
-        let mut rng = rand::thread_rng();
         let mut intervals = intervals.iter();
         let first_interval = intervals.next().unwrap();
         let mut read_ratio = first_interval.get_read_ratio();
@@ -74,7 +75,7 @@ impl Client {
                     }
                 }
                 _ = request_interval.tick(), if self.final_request_count.is_none() => {
-                    let is_write = rng.gen::<f64>() > read_ratio;
+                    let is_write = self.rng.gen::<f64>() > read_ratio;
                     let query_type = if is_write {
                         QueryType::Insert
                     } else {
@@ -128,22 +129,35 @@ impl Client {
         } else {
             self.next_request_id - 1
         };
-        let key = self.next_request_id.to_string();
+        let key = self.next_request_id;
         let cmd = match query_type {
             QueryType::Create => SqlCommand::create_table_cmd(),
             QueryType::Insert => {
                 let value = format!("{}_{}", self.id, key);
-                SqlCommand::insert_cmd(key, value)
+                let another_value = format!("{}_{}", self.id, key + 100);
+                SqlCommand::insert_cmd(vec![key, key + 100], vec![value, another_value])
             },
             // It's not very interesting to select a key that doesn't exist, so we'll just select the previous key.
             // TODO use different consistency levels for reads.
-            _ => SqlCommand::select_cmd(prev_key.to_string(), Consistency::Leader),
+            _ => {
+                let random_value = self.rng.gen::<f64>();
+                let keys = vec![prev_key, key + 100];
+                if random_value > 0.6 {
+                    SqlCommand::select_cmd(keys, Consistency::Local)
+                }
+                else if random_value > 0.2 {
+                    SqlCommand::select_cmd(keys, Consistency::Leader)
+                }
+                else {
+                    SqlCommand::select_cmd(keys, Consistency::Linearizable)
+                }
+            }
         };
-        let request = ClientMessage::Handle(self.next_request_id, cmd.clone());
+        let request = ClientMessage::Handle(self.next_request_id.try_into().unwrap(), cmd.clone());
         debug!("Sending {request:?}");
         self.network.send(self.active_server, request).await;
         self.client_data
-            .new_request(cmd, self.next_request_id);
+            .new_request(cmd, self.next_request_id.try_into().unwrap());
         self.next_request_id += 1;
     }
 

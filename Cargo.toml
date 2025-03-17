@@ -28,12 +28,8 @@ name = "client"
 path = "src/client/main.rs"
 
 [[bin]]
-name = "server"
-path = "src/server/main.rs"
-
-[[bin]]
-name = "test_coordinator"
-path = "src/test_coordinator/main.rs"
+name = "coordinator"
+path = "src/server/coordinator/main.rs"
 
 [[bin]]
 name = "shard"

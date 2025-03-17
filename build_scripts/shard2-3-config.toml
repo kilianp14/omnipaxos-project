@@ -1,0 +1,6 @@
+location = "local-9"
+server_id = 3
+shard_id = 2
+listen_address = "127.0.0.1"
+listen_port = 10009
+output_filepath = "./logs/shard2-3.json"

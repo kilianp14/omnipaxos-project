@@ -16,7 +16,7 @@ const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub struct OmniPaxosServer {
+pub struct OmniPaxosCoordinator {
     id: NodeId,
     network: Box<dyn NetworkTrait>,
     omnipaxos: OmniPaxosInstance,
@@ -25,11 +25,13 @@ pub struct OmniPaxosServer {
     config: OmniPaxosCoordinatorConfig,
     peers: Vec<NodeId>,
     shard_ranges: Vec<(Range<i64>, ShardId)>,
-    pending_transactions: HashMap<CommandId, (Timestamp, ClientId, Vec<(ShardId, bool)>)>,
-    pending_executions: HashMap<CommandId, (Timestamp, ClientId, Vec<(ShardId, Option<Result<String, DatabaseError>>)>)>,
+    // Maps command id to timestemp for timeouts (still TODO), client, involved shards, and number of received acks
+    pending_transactions: HashMap<CommandId, (Timestamp, ClientId, Vec<ShardId>, usize)>,
+    // Maps command id to timestemp for timeouts (still TODO), client, number of expected acks, received answers
+    pending_executions: HashMap<CommandId, (Timestamp, ClientId, usize, Vec<Result<String, DatabaseError>>)>,
 }
 
-impl OmniPaxosServer {
+impl OmniPaxosCoordinator {
     pub async fn new(config: OmniPaxosCoordinatorConfig, network: Box<dyn NetworkTrait>) -> Self {
         // Initialize OmniPaxos instance
         let storage: MemoryStorage<Command> = MemoryStorage::default();
@@ -43,7 +45,7 @@ impl OmniPaxosServer {
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
 
-        OmniPaxosServer {
+        OmniPaxosCoordinator {
             id: config.local.server_id,
             network,
             omnipaxos,
@@ -88,7 +90,7 @@ impl OmniPaxosServer {
                         self.handle_client_messages(&mut client_msg_buf).await;
                     }
                     if !shard_msg_buf.is_empty() {
-                        self.handle_shard_messages(shard_msg_buf).await;
+                        self.handle_shard_messages(&mut shard_msg_buf).await;
                     }
                 },
             }
@@ -160,59 +162,79 @@ impl OmniPaxosServer {
 
     fn process_decided_entries(&mut self, commands: Vec<Command>) {
         // iterate over all commands that we are the coordinator for
-        for command in commands.into_iter().filter(|cmd| cmd.coordinator_id == self.id) {
-            let shard_messages: Vec<(ShardId, CoordinatorMessage)> = match command.phase {
-                Phase::Prepare => {
-                    if let Some(sql_command) = command.sql_cmd {
-                        let shard_sql_commands: Vec<(ShardId, SqlCommand)>;
-                        if matches!(sql_command.query_type, QueryType::Create) {
-                            shard_sql_commands = self.config.local.shards.clone().into_iter().map(|n| (n, sql_command.clone())).collect();
+        for command in commands{
+            match command {
+                Command::Prepare(command_id, client_id, coordinator_id, sql_command) => {
+                    let shard_sql_commands: Vec<(ShardId, SqlCommand)>;
+                    if matches!(sql_command.query_type, QueryType::Create) {
+                        shard_sql_commands = self.config.local.shards.clone().into_iter().map(|n| (n, sql_command.clone())).collect();
+                    }
+                    else {
+                        shard_sql_commands = self.split_by_shard(sql_command);
+                    }
+                    if shard_sql_commands.is_empty() {
+                        self.network.send_to_client(client_id, ServerMessage::Answer(command_id, "All keys invalid".to_string()));
+                        continue;
+                    }
+                    let shards_in_transaction = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| shard_id).collect();
+                    self.pending_transactions.insert(command_id, (Utc::now().timestamp_millis(), client_id, shards_in_transaction, 0));
+                    if coordinator_id == self.id {
+                        for (shard_id, sql_command) in shard_sql_commands {
+                            self.network.send_to_shard(shard_id, CoordinatorMessage{command: Command::Prepare(command_id, client_id, coordinator_id, sql_command)});
+                        }
+                    }
+                },
+                Command::Commit(command_id, coordinator_id) => {
+                    if coordinator_id == self.id {
+                        if let Some((_, _, involved_shards, _)) = self.pending_transactions.get(&command_id) {
+                            for shard_id in involved_shards {
+                                self.network.send_to_shard(*shard_id, CoordinatorMessage{command: Command::Commit(command_id, coordinator_id)});
+                            }
                         }
                         else {
-                            shard_sql_commands = self.split_by_shard(sql_command);
-                        }
-                        if shard_sql_commands.is_empty() {
-                            self.network.send_to_client(command.client_id, ServerMessage::Answer(command.command_id, "All keys invalid".to_string()));
+                            error!("Command to be committed that is not in pending transactions");
                             continue;
                         }
-                        let shards_in_transaction = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| (shard_id, false)).collect();
-                        self.pending_transactions.insert(command.command_id, (Utc::now().timestamp_millis(), command.client_id, shards_in_transaction));
-                        shard_sql_commands
-                            .into_iter()
-                            .map(|(shard_id, sql_command)| (shard_id, CoordinatorMessage::Prepare(command.command_id, sql_command)))
-                            .collect()
                     }
-                    else {
-                        error!("Empty sql command in prepare phase");
-                        continue;
-                    }
+                    self.pending_transactions.remove(&command_id);
                 },
-                Phase::Commit => {
-                    if let Some((_, _, involved_shards)) = self.pending_transactions.get(&command.command_id) {
-                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Commit(command.command_id))).collect()
+                Command::Abort(command_id, coordinator_id) => {
+                    if coordinator_id == self.id {
+                        if let Some((_, _, involved_shards, _)) = self.pending_transactions.get(&command_id) {
+                            for shard_id in involved_shards {
+                                self.network.send_to_shard(*shard_id, CoordinatorMessage{command: Command::Abort(command_id, coordinator_id)});
+                            }
+                        }
+                        else {
+                            error!("Command to be aborted that is not in pending transactions");
+                            continue;
+                        }
                     }
-                    else {
-                        error!("Command to be committed that is not in pending transactions");
-                        continue;
-                    }
+                    self.pending_transactions.remove(&command_id);
                 },
-                Phase::Abort => {
-                    if let Some((_, _, involved_shards)) = self.pending_transactions.get(&command.command_id) {
-                        involved_shards.into_iter().map(|(shard_id, _)| (*shard_id, CoordinatorMessage::Abort(command.command_id))).collect()
+                Command::Ack(command_id, coordinator_id) => {
+                    if let Some((_, _, involved_shards, mut number_of_acks)) = self.pending_transactions.get_mut(&command_id) {
+                        number_of_acks += 1;
+                        if number_of_acks == involved_shards.len() && self.id == coordinator_id {
+                            self.omnipaxos
+                            .append(Command::Commit(command_id, self.id))
+                            .expect("Append to Omnipaxos log failed");
+                        }
                     }
-                    else {
-                        error!("Command to be committed that is not in pending transactions");
-                        continue;
+                }
+                Command::Nack(command_id, coordinator_id) => {
+                    if let Some((_, _, _, _)) = self.pending_transactions.get(&command_id) {
+                        if self.id == coordinator_id {
+                            self.omnipaxos
+                            .append(Command::Abort(command_id, self.id))
+                            .expect("Append to Omnipaxos log failed");
+                        }
                     }
-                },
-                Phase::Execute => {
-                    error!("Execute commands should not be in the log");
-                    continue;
+                }
+                _ => {
+                    error!("Invalid command type in coordinator log");
                 }
             };
-            for (shard_id, shard_msg) in shard_messages {
-                self.network.send_to_shard(shard_id, shard_msg);
-            }
         }
     }
 
@@ -237,14 +259,15 @@ impl OmniPaxosServer {
                             self.network.send_to_client(from,  ServerMessage::Answer(command_id, "All keys invalid".to_string()));
                             continue;
                         }
-                        let shards_in_execution = shard_sql_commands.clone().into_iter().map(|(shard_id, _)| (shard_id, None)).collect();
-                        self.pending_executions.insert(command_id, (Utc::now().timestamp_millis(), from, shards_in_execution));
+                        self.pending_executions.insert(command_id, (Utc::now().timestamp_millis(), from, shard_sql_commands.len(), Vec::with_capacity(shard_sql_commands.len())));
                         for (shard_id, shard_sql) in shard_sql_commands {
-                            self.network.send_to_shard(shard_id, CoordinatorMessage::Execute(command_id, shard_sql));
+                            self.network.send_to_shard(shard_id, CoordinatorMessage{command: Command::Execute(command_id, shard_sql)});
                         }
                     }
                     else {
-                        self.append_to_log(from, command_id, Some(sql_command), Phase::Prepare);
+                        self.omnipaxos
+                            .append(Command::Prepare(command_id, from, self.id, sql_command))
+                            .expect("Append to Omnipaxos log failed");
                     }
                 },
             }
@@ -275,21 +298,42 @@ impl OmniPaxosServer {
 
     async fn handle_shard_messages(&mut self, messages: &mut Vec<(ShardId, ShardMessage)>) {
         for (from, message) in messages.drain(..){
-
+            match message {
+                ShardMessage::Ack(command_id) => {
+                    self.omnipaxos
+                        .append(Command::Ack(command_id, from))
+                        .expect("Append to omnipaxos log failed")
+                }
+                ShardMessage::Nack(command_id) => {
+                    self.omnipaxos
+                        .append(Command::Nack(command_id, from))
+                        .expect("Append to omnipaxos log failed")
+                }
+                ShardMessage::Answer(command_id, result) => {
+                    let execution = self.pending_executions.get_mut(&command_id);
+                    match execution {
+                        Some((_, client_id, expected_acks, results)) => {
+                            results.push(result);
+                            if results.len() == *expected_acks {
+                                let mut response: String = String::new();
+                                for result in results {
+                                    match result {
+                                        Ok(str) => response.push_str(str),
+                                        Err(err) => {
+                                            response = format!("Internal Error: {}", err.message);
+                                            break;
+                                        }
+                                    }
+                                }
+                                self.network.send_to_client(*client_id, ServerMessage::Answer(command_id, response));
+                                self.pending_executions.remove(&command_id);
+                            }
+                        }
+                        None => error!("Answer from shard to a non-pending execution")
+                    } 
+                }
+            }
         }
-    }
-
-    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, sql_command: Option<SqlCommand>, phase: Phase) {
-        let command = Command {
-            client_id: from,
-            coordinator_id: self.id,
-            command_id: command_id,
-            sql_cmd: sql_command,
-            phase: phase,
-        };
-        self.omnipaxos
-            .append(command)
-            .expect("Append to Omnipaxos log failed");
     }
 
     fn send_cluster_start_signals(&mut self, start_time: Timestamp) {

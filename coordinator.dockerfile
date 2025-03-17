@@ -21,10 +21,10 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Build application
 COPY . .
-RUN cargo build --release --bin test_coordinator
+RUN cargo build --release --bin coordinator
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
-COPY --from=builder /app/target/release/test_coordinator /usr/local/bin
+COPY --from=builder /app/target/release/coordinator /usr/local/bin
 EXPOSE 8000
-ENTRYPOINT ["/usr/local/bin/test_coordinator"]
+ENTRYPOINT ["/usr/local/bin/coordinator"]

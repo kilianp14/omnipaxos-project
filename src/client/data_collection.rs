@@ -35,9 +35,19 @@ impl ClientData {
     }
 
     pub fn new_request(&mut self, command: SqlCommand, command_id: CommandId) {
-        let values = match command.query_type {
-            QueryType::Insert => command.values.clone().map(|v| v.join(",")),
-            QueryType::Select => command.conditions,
+        let values :Option<String> = match command.query_type {
+            QueryType::Insert => {
+                if let Some(vals) = command.values.clone() {
+                    Some(vals.iter().map(|v| v.join(",")).collect::<Vec<String>>().join("."))
+                }
+                else {None}
+            },
+            QueryType::Select => {
+                if let Some(keys) = command.keys.clone() {
+                    Some(keys.iter().map(|key| key.to_string()).collect::<Vec<String>>().join("."))
+                }
+                else {None}
+            },
             _ => None,
         };
         let data = RequestData {
@@ -52,10 +62,10 @@ impl ClientData {
         self.request_data.push(data);
     }
 
-    pub fn new_response(&mut self, command_id: CommandId, response: Option<String>) {
+    pub fn new_response(&mut self, command_id: CommandId, response: String) {
         let response_time = Utc::now().timestamp_millis();
         self.request_data[command_id].response_time = Some(response_time);
-        self.request_data[command_id].response_value = response;
+        self.request_data[command_id].response_value = Some(response);
         self.response_count += 1;
     }
 

@@ -1,56 +1,55 @@
 use futures::{SinkExt, StreamExt};
 use async_trait::async_trait;
 use log::*;
-use omnipaxos::messages::{Message, sequence_paxos::{PaxosMessage, PaxosMsg, Decide}};
 use omnipaxos_sql::common::{
     messages::*,
-    sql::{ClientId, NodeId},
+    sql::{ClientId, NodeId, ShardId},
+    utils::*,
 };
-use std::collections::HashMap;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio_serde::{formats::Bincode, Framed};
-use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
-use std::{net::{SocketAddr, ToSocketAddrs}, vec};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::str::FromStr;
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use std::{collections::HashMap, str::FromStr};
+use tokio::{select, sync::mpsc::{Sender, UnboundedSender}};
 use tokio::{
-    select,
     net::{TcpListener, TcpStream},
     sync::mpsc::Receiver,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
-use serde::{Serialize, Deserialize};
 
-use crate::{lib::OmniPaxosSqlConfig, network::NetworkTrait};
+use omnipaxos_sql::server::configs::OmniPaxosCoordinatorConfig;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ServerAnswer {
-    ServerMessage(ServerMessage),
-    Decide(NodeId, ClusterMessage),
+#[async_trait]
+pub trait NetworkTrait {
+    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage);
+    fn send_to_client(&mut self, client_id: ClientId, msg: ServerMessage);
+    fn send_to_shard(&mut self, shard_id: ShardId, msg: CoordinatorMessage);
+    async fn recv_many(
+        &mut self,
+        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
+        client_msg_buf: &mut Vec<(ClientId, ClientMessage)>,
+        shard_msg_buf: &mut Vec<(ShardId, ShardMessage)>,
+        batch_size: usize,
+    );
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum CoordinatorMessage {
-    ClientMessage(ClientMessage),
-    ClusterMessage(ClusterMessage),
-    Disconnect(NodeId),
-    Reconnect(NodeId),
-}
-
-pub struct TestNetwork {
+pub struct Network {
     peers: Vec<NodeId>,
+    shards: Vec<ShardId>,
     peer_connections: Vec<Option<PeerConnection>>,
-    coordinator_connection: Option<CoordinatorConnection>,
+    client_connections: HashMap<ClientId, ClientConnection>,
+    shard_connections: Vec<Option<ShardConnection>>,
+    max_client_id: Arc<Mutex<ClientId>>,
     batch_size: usize,
-    coordinator_message_sender: Sender<(ClientId, CoordinatorMessage)>,
+    client_message_sender: Sender<(ClientId, ClientMessage)>,
     cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
+    shard_message_sender: Sender<(ShardId, ShardMessage)>,
     cluster_messages: Receiver<(NodeId, ClusterMessage)>,
-    coordinator_messages: Receiver<(ClientId, CoordinatorMessage)>,
-    disconnected: HashMap<NodeId, (Vec<ClusterMessage>, Vec<ClusterMessage>)>,
+    client_messages: Receiver<(ClientId, ClientMessage)>,
+    shard_messages: Receiver<(ShardId, ShardMessage)>,
 }
 
-fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
+fn get_peer_addrs(config: OmniPaxosCoordinatorConfig) -> (SocketAddr, Vec<SocketAddr>) {
     let listen_address_str = format!(
         "{}:{}",
         config.local.listen_address, config.local.listen_port
@@ -70,50 +69,60 @@ fn get_addrs(config: OmniPaxosSqlConfig) -> (SocketAddr, Vec<SocketAddr>) {
     (listen_address, node_addresses)
 }
 
+fn get_shard_addrs(config: OmniPaxosCoordinatorConfig) -> Vec<SocketAddr> {
+    config
+        .local
+        .shard_addrs
+        .into_iter()
+        .map(|addr_str| match addr_str.to_socket_addrs() {
+            Ok(mut addrs) => addrs.next().unwrap(),
+            Err(e) => panic!("Address {addr_str} is invalid: {e}"),
+        })
+        .collect()
+}
+
 #[async_trait]
-impl NetworkTrait for TestNetwork {
+impl NetworkTrait for Network {
 
     fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
-        if let Some((sending, _)) = self.disconnected.get_mut(&to) {
-            sending.push(msg);
-        }
-        else if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
-            PaxosMessage { from: _, to: node_id, msg: PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) }
-        )) = msg {
-            match &mut self.coordinator_connection {
+        match self.cluster_id_to_idx(to) {
+            Some(idx) => match &mut self.peer_connections[idx] {
                 Some(ref mut connection) => {
-                    if let Err(err) = connection.send(ServerAnswer::Decide(node_id, msg)) {
-                        warn!("Couldn't send msg to coordinator: {err}");
-                        self.coordinator_connection = None;
+                    if let Err(err) = connection.send(msg) {
+                        warn!("Couldn't send msg to peer {to}: {err}");
+                        self.peer_connections[idx] = None;
                     }
                 }
-                None => warn!("Not connected to coordinator"),
-            }
-        }
-        else {
-            match self.cluster_id_to_idx(to) {
-                Some(idx) => match &mut self.peer_connections[idx] {
-                    Some(ref mut connection) => {
-                        if let Err(err) = connection.send(msg) {
-                            warn!("Couldn't send msg to peer {to}: {err}");
-                            self.peer_connections[idx] = None;
-                        }
-                    }
-                    None => warn!("Not connected to node {to}"),
-                },
-                None => error!("Sending to unexpected node {to}"),
-            }
+                None => warn!("Not connected to node {to}"),
+            },
+            None => error!("Sending to unexpected node {to}"),
         }
     }
 
     fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
-        match &mut self.coordinator_connection {
+        match self.client_connections.get_mut(&to) {
             Some(connection) => {
-                if let Err(err) = connection.send(ServerAnswer::ServerMessage(msg)) {
-                    warn!("Couldn't send msg to coordinator {to}: {err}");
+                if let Err(err) = connection.send(msg) {
+                    warn!("Couldn't send msg to client {to}: {err}");
+                    self.client_connections.remove(&to);
                 }
             }
-            None => warn!("Not connected to coordinator {to}"),
+            None => warn!("Not connected to client {to}"),
+        }
+    }
+
+    fn send_to_shard(&mut self, to: ShardId, msg: CoordinatorMessage) {
+        match self.shard_id_to_idx(to) {
+            Some(idx) => match &mut self.shard_connections[idx] {
+                Some(ref mut connection) => {
+                    if let Err(err) = connection.send(msg) {
+                        warn!("Couldn't send msg to shard {to}: {err}");
+                        self.shard_connections[idx] = None;
+                    }
+                }
+                None => warn!("Not connected to shard {to}"),
+            },
+            None => error!("Sending to unexpected shard {to}"),
         }
     }
 
@@ -121,47 +130,21 @@ impl NetworkTrait for TestNetwork {
         &mut self,
         cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
         client_msg_buf: &mut Vec<(ClientId, ClientMessage)>,
+        shard_msg_buf: &mut Vec<(ShardId, ShardMessage)>,
         batch_size: usize,
     ) {
         let mut timeout_interval = tokio::time::interval(Duration::from_millis(5));
 
-        while cluster_msg_buf.len() < batch_size || client_msg_buf.len() < batch_size {
+        while cluster_msg_buf.len() < batch_size || client_msg_buf.len() < batch_size || shard_msg_buf.len() < batch_size {
             select! {
-                Some((id, msg)) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
-                    if let Some((_, receiving)) = self.disconnected.get_mut(&id){
-                        receiving.push(msg);
-                    }
-                    else {
-                        cluster_msg_buf.push((id, msg));
-                    }
+                Some(msg) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
+                    cluster_msg_buf.push(msg);
                 }
-                Some(msg) = self.coordinator_messages.recv(), if (client_msg_buf.len() < batch_size && cluster_msg_buf.len() < batch_size) => {
-                    match msg {
-                        (id, CoordinatorMessage::ClusterMessage(cls_msg)) => {
-                            if let Some((_, receiving)) = self.disconnected.get_mut(&id){
-                                receiving.push(cls_msg);
-                            }
-                            else {
-                                cluster_msg_buf.push((id, cls_msg));
-                            }
-                        },
-                        (id, CoordinatorMessage::ClientMessage(cli_msg)) => {
-                            client_msg_buf.push((id, cli_msg));
-                        },
-                        (_, CoordinatorMessage::Disconnect(node_id)) => {
-                            self.disconnected.insert(node_id, (Vec::with_capacity(100), Vec::with_capacity(100)));
-                        },
-                        (_, CoordinatorMessage::Reconnect(node_id)) => {
-                            if let Some((sending, received)) = self.disconnected.remove(&node_id) {
-                                for message in received {
-                                    cluster_msg_buf.push((node_id, message));
-                                }
-                                for message in sending {
-                                    self.send_to_cluster(node_id, message);
-                                }
-                            }
-                        },
-                    };
+                Some(msg) = self.client_messages.recv(), if client_msg_buf.len() < batch_size => {
+                    client_msg_buf.push(msg);
+                }
+                Some(msg) = self.shard_messages.recv(), if shard_msg_buf.len() < batch_size => {
+                    shard_msg_buf.push(msg);
                 }
                 _ = timeout_interval.tick() => break,
             }
@@ -170,9 +153,10 @@ impl NetworkTrait for TestNetwork {
 }
 
 
-impl TestNetwork {
-    pub async fn new(config: OmniPaxosSqlConfig, batch_size: usize) -> Self {
-        let (listen_address, node_addresses) = get_addrs(config.clone());
+impl Network {
+    pub async fn new(config: OmniPaxosCoordinatorConfig, batch_size: usize) -> Self {
+        let (listen_address, node_addresses) = get_peer_addrs(config.clone());
+        let shard_addresses = get_shard_addrs(config.clone());
         let id = config.local.server_id;
         let peer_addresses: Vec<(NodeId, SocketAddr)> = config
             .cluster
@@ -181,24 +165,38 @@ impl TestNetwork {
             .zip(node_addresses.into_iter())
             .filter(|(node_id, _addr)| *node_id != id)
             .collect();
+        let shard_addresses: Vec<(ShardId, SocketAddr)> = config
+            .local
+            .shards
+            .into_iter()
+            .zip(shard_addresses.into_iter())
+            .filter(|(node_id, _addr)| *node_id != id)
+            .collect();
         let mut cluster_connections = vec![];
         cluster_connections.resize_with(peer_addresses.len(), Default::default);
+        let mut shard_connections = vec![];
+        shard_connections.resize_with(shard_addresses.len(), Default::default);
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(batch_size);
-        let (coordinator_message_sender, coordinator_messages) = tokio::sync::mpsc::channel(batch_size);
-        let disconnected = HashMap::new();
+        let (shard_message_sender, shard_messages) = tokio::sync::mpsc::channel(batch_size);
+        let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(batch_size);
         let mut network = Self {
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
+            shards: shard_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
-            coordinator_connection: None,
+            client_connections: HashMap::new(),
+            shard_connections: shard_connections,
+            max_client_id: Arc::new(Mutex::new(0)),
             batch_size,
-            coordinator_message_sender,
+            client_message_sender,
             cluster_message_sender,
+            shard_message_sender,
             cluster_messages,
-            coordinator_messages,
-            disconnected,
+            client_messages,
+            shard_messages,
         };
+        let num_clients = config.local.num_clients;
         network
-            .initialize_connections(id, peer_addresses, listen_address)
+            .initialize_connections(id, num_clients, peer_addresses, shard_addresses, listen_address)
             .await;
         network
     }
@@ -206,26 +204,36 @@ impl TestNetwork {
     async fn initialize_connections(
         &mut self,
         id: NodeId,
+        num_clients: usize,
         peers: Vec<(NodeId, SocketAddr)>,
+        shards: Vec<(ShardId, SocketAddr)>,
         listen_address: SocketAddr,
     ) {
         let (connection_sink, mut connection_source) = mpsc::channel(30);
         let listener_handle =
             self.spawn_connection_listener(connection_sink.clone(), listen_address);
         self.spawn_peer_connectors(connection_sink.clone(), id, peers);
+        self.spawn_shard_connectors(connection_sink.clone(), shards);
         while let Some(new_connection) = connection_source.recv().await {
             match new_connection {
                 NewConnection::ToPeer(connection) => {
                     let peer_idx = self.cluster_id_to_idx(connection.peer_id).unwrap();
                     self.peer_connections[peer_idx] = Some(connection);
                 }
-                NewConnection::ToCoordinator(connection) => {
-                    self.coordinator_connection = Some(connection);
+                NewConnection::ToShard(connection) => {
+                    let shard_idx = self.shard_id_to_idx(connection.shard_id).unwrap();
+                    self.shard_connections[shard_idx] = Some(connection);
+                }
+                NewConnection::ToClient(connection) => {
+                    let _ = self
+                        .client_connections
+                        .insert(connection.client_id, connection);
                 }
             }
-            let coordinator_connected = self.coordinator_connection.is_some();
+            let all_clients_connected = self.client_connections.len() >= num_clients;
+            let all_shards_connected = self.shard_connections.len() >= self.shards.len();
             let all_cluster_connected = self.peer_connections.iter().all(|c| c.is_some());
-            if coordinator_connected && all_cluster_connected {
+            if all_clients_connected && all_cluster_connected && all_shards_connected {
                 listener_handle.abort();
                 break;
             }
@@ -237,8 +245,9 @@ impl TestNetwork {
         connection_sender: Sender<NewConnection>,
         listen_address: SocketAddr,
     ) -> tokio::task::JoinHandle<()> {
-        let client_sender = self.coordinator_message_sender.clone();
+        let client_sender = self.client_message_sender.clone();
         let cluster_sender = self.cluster_message_sender.clone();
+        let max_client_id_handle = self.max_client_id.clone();
         let batch_size = self.batch_size;
         tokio::spawn(async move {
             let listener = TcpListener::bind(listen_address).await.unwrap();
@@ -252,6 +261,7 @@ impl TestNetwork {
                             client_sender.clone(),
                             cluster_sender.clone(),
                             connection_sender.clone(),
+                            max_client_id_handle.clone(),
                             batch_size,
                         ));
                     }
@@ -263,9 +273,10 @@ impl TestNetwork {
 
     async fn handle_incoming_connection(
         connection: TcpStream,
-        client_message_sender: Sender<(ClientId, CoordinatorMessage)>,
+        client_message_sender: Sender<(ClientId, ClientMessage)>,
         cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
         connection_sender: Sender<NewConnection>,
+        max_client_id_handle: Arc<Mutex<ClientId>>,
         batch_size: usize,
     ) {
         // Identify connector's ID and type by handshake
@@ -283,13 +294,23 @@ impl TestNetwork {
                 ))
             }
             Some(Ok(RegistrationMessage::ClientRegister)) => {
-                info!("Identified connection from coordinator");
+                let next_client_id = {
+                    let mut max_client_id = max_client_id_handle.lock().unwrap();
+                    *max_client_id += 1;
+                    *max_client_id
+                };
+                info!("Identified connection from client {next_client_id}");
                 let underlying_stream = registration_connection.into_inner().into_inner();
-                NewConnection::ToCoordinator(CoordinatorConnection::new(
+                NewConnection::ToClient(ClientConnection::new(
+                    next_client_id,
                     underlying_stream,
                     batch_size,
                     client_message_sender,
                 ))
+            }
+            Some(Ok(RegistrationMessage::CoordinatorRegister)) => {
+                // Handled on the shard side
+                return;
             }
             Some(Err(err)) => {
                 error!("Error deserializing handshake: {:?}", err);
@@ -348,14 +369,62 @@ impl TestNetwork {
         }
     }
 
-    // Removes all client and peer connections and ends their corresponding tasks.
+    fn spawn_shard_connectors(
+        &self,
+        connection_sender: Sender<NewConnection>,
+        shards: Vec<(ShardId, SocketAddr)>,
+    ) {
+        for (shard, shard_address) in shards {
+            let reconnect_delay = Duration::from_secs(1);
+            let mut reconnect_interval = tokio::time::interval(reconnect_delay);
+            let shard_sender = self.shard_message_sender.clone();
+            let connection_sender = connection_sender.clone();
+            let batch_size = self.batch_size;
+            tokio::spawn(async move {
+                // Establish connection
+                let shard_connection = loop {
+                    reconnect_interval.tick().await;
+                    match TcpStream::connect(shard_address).await {
+                        Ok(connection) => {
+                            info!("New connection to shard {shard}");
+                            connection.set_nodelay(true).unwrap();
+                            break connection;
+                        }
+                        Err(err) => {
+                            error!("Establishing connection to node {shard} failed: {err}")
+                        }
+                    }
+                };
+                // Send handshake
+                let mut registration_connection = frame_registration_connection(shard_connection);
+                let handshake = RegistrationMessage::CoordinatorRegister;
+                if let Err(err) = registration_connection.send(handshake).await {
+                    error!("Error sending handshake to {shard}: {err}");
+                    return;
+                }
+                let underlying_stream = registration_connection.into_inner().into_inner();
+                // Create connection actor
+                let shard_actor =
+                    ShardConnection::new(shard, underlying_stream, batch_size, shard_sender);
+                let new_connection = NewConnection::ToShard(shard_actor);
+                connection_sender.send(new_connection).await.unwrap();
+            });
+        }
+    }
+
+    // Removes all client, peer, and shard connections and ends their corresponding tasks.
     #[allow(dead_code)]
     pub fn shutdown(&mut self) {
-        if let Some(connection) = self.coordinator_connection.take() {
-            connection.close();
+        for (_, client_connection) in self.client_connections.drain() {
+            client_connection.close();
         }
         for peer_connection in self.peer_connections.drain(..) {
             if let Some(connection) = peer_connection {
+                connection.close();
+            }
+        }
+        for shard_connection in self.shard_connections.drain(..) {
+            if let Some(connection) = shard_connection {
                 connection.close();
             }
         }
@@ -368,11 +437,17 @@ impl TestNetwork {
     fn cluster_id_to_idx(&self, id: NodeId) -> Option<usize> {
         self.peers.iter().position(|&p| p == id)
     }
+
+    #[inline]
+    fn shard_id_to_idx(&self, id: ShardId) -> Option<usize> {
+        self.shards.iter().position(|&p| p == id)
+    }
 }
 
 enum NewConnection {
     ToPeer(PeerConnection),
-    ToCoordinator(CoordinatorConnection),
+    ToClient(ClientConnection),
+    ToShard(ShardConnection),
 }
 
 struct PeerConnection {
@@ -447,17 +522,91 @@ impl PeerConnection {
     }
 }
 
-struct CoordinatorConnection {
+struct ShardConnection {
+    shard_id: ShardId,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
-    outgoing_messages: UnboundedSender<ServerAnswer>,
+    outgoing_messages: UnboundedSender<CoordinatorMessage>,
 }
 
-impl CoordinatorConnection {
+impl ShardConnection {
     pub fn new(
+        shard_id: ShardId,
         connection: TcpStream,
         batch_size: usize,
-        incoming_messages: Sender<(ClientId, CoordinatorMessage)>,
+        incoming_messages: Sender<(ShardId, ShardMessage)>,
+    ) -> Self {
+        let (reader, mut writer) = frame_coordinator_connection(connection);
+        // Reader Actor
+        let reader_task = tokio::spawn(async move {
+            let mut buf_reader = reader.ready_chunks(batch_size);
+            while let Some(messages) = buf_reader.next().await {
+                for msg in messages {
+                    match msg {
+                        Ok(m) => {
+                            if let Err(_) = incoming_messages.send((shard_id, m)).await {
+                                break;
+                            };
+                        }
+                        Err(err) => {
+                            error!("Error deserializing message: {:?}", err);
+                        }
+                    }
+                }
+            }
+        });
+        // Writer Actor
+        let (message_tx, mut message_rx) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(async move {
+            let mut buffer = Vec::with_capacity(batch_size);
+            while message_rx.recv_many(&mut buffer, batch_size).await != 0 {
+                for msg in buffer.drain(..) {
+                    if let Err(err) = writer.feed(msg).await {
+                        error!("Couldn't send message to shard {shard_id}: {err}");
+                        break;
+                    }
+                }
+                if let Err(err) = writer.flush().await {
+                    error!("Couldn't send message to shard {shard_id}: {err}");
+                    break;
+                }
+            }
+            info!("Connection to node {shard_id} closed");
+        });
+        ShardConnection {
+            shard_id,
+            reader_task,
+            writer_task,
+            outgoing_messages: message_tx,
+        }
+    }
+
+    pub fn send(
+        &mut self,
+        msg: CoordinatorMessage,
+    ) -> Result<(), mpsc::error::SendError<CoordinatorMessage>> {
+        self.outgoing_messages.send(msg)
+    }
+
+    fn close(self) {
+        self.reader_task.abort();
+        self.writer_task.abort();
+    }
+}
+
+struct ClientConnection {
+    client_id: ClientId,
+    reader_task: JoinHandle<()>,
+    writer_task: JoinHandle<()>,
+    outgoing_messages: UnboundedSender<ServerMessage>,
+}
+
+impl ClientConnection {
+    pub fn new(
+        client_id: ClientId,
+        connection: TcpStream,
+        batch_size: usize,
+        incoming_messages: Sender<(ClientId, ClientMessage)>,
     ) -> Self {
         let (reader, mut writer) = frame_servers_connection(connection);
         // Reader Actor
@@ -466,7 +615,7 @@ impl CoordinatorConnection {
             while let Some(messages) = buf_reader.next().await {
                 for msg in messages {
                     match msg {
-                        Ok(m) => incoming_messages.send((1, m)).await.unwrap(),
+                        Ok(m) => incoming_messages.send((client_id, m)).await.unwrap(),
                         Err(err) => error!("Error deserializing message: {:?}", err),
                     }
                 }
@@ -479,19 +628,20 @@ impl CoordinatorConnection {
             while message_rx.recv_many(&mut buffer, batch_size).await != 0 {
                 for msg in buffer.drain(..) {
                     if let Err(err) = writer.feed(msg).await {
-                        error!("Couldn't send message to coordinator: {err}");
-                        error!("Killing connection to coordinator");
+                        error!("Couldn't send message to client {client_id}: {err}");
+                        error!("Killing connection to client {client_id}");
                         return;
                     }
                 }
                 if let Err(err) = writer.flush().await {
-                    error!("Couldn't send message to coordinator: {err}");
-                    error!("Killing connection to coordinator");
+                    error!("Couldn't send message to client {client_id}: {err}");
+                    error!("Killing connection to client {client_id}");
                     return;
                 }
             }
         });
-        CoordinatorConnection {
+        ClientConnection {
+            client_id,
             reader_task,
             writer_task,
             outgoing_messages: message_tx,
@@ -500,8 +650,8 @@ impl CoordinatorConnection {
 
     pub fn send(
         &mut self,
-        msg: ServerAnswer,
-    ) -> Result<(), mpsc::error::SendError<ServerAnswer>> {
+        msg: ServerMessage,
+    ) -> Result<(), mpsc::error::SendError<ServerMessage>> {
         self.outgoing_messages.send(msg)
     }
 
@@ -509,73 +659,4 @@ impl CoordinatorConnection {
         self.reader_task.abort();
         self.writer_task.abort();
     }
-}
-
-pub type RegistrationConnection = Framed<
-    CodecFramed<TcpStream, LengthDelimitedCodec>,
-    RegistrationMessage,
-    RegistrationMessage,
-    Bincode<RegistrationMessage, RegistrationMessage>,
->;
-
-pub fn frame_registration_connection(stream: TcpStream) -> RegistrationConnection {
-    let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
-    Framed::new(length_delimited, Bincode::default())
-}
-
-pub type FromNodeConnection = Framed<
-    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
-    ClusterMessage,
-    (),
-    Bincode<ClusterMessage, ()>,
->;
-pub type ToNodeConnection = Framed<
-    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
-    (),
-    ClusterMessage,
-    Bincode<(), ClusterMessage>,
->;
-
-pub fn frame_cluster_connection(stream: TcpStream) -> (FromNodeConnection, ToNodeConnection) {
-    let (reader, writer) = stream.into_split();
-    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
-    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
-    (
-        FromNodeConnection::new(stream, Bincode::default()),
-        ToNodeConnection::new(sink, Bincode::default()),
-    )
-}
-
-// pub type ServerConnection = Framed<
-//     CodecFramed<TcpStream, LengthDelimitedCodec>,
-//     ServerMessage,
-//     ClientMessage,
-//     Bincode<ServerMessage, ClientMessage>,
-// >;
-
-
-pub type FromClientConnection = Framed<
-    FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
-    CoordinatorMessage,
-    (),
-    Bincode<CoordinatorMessage, ()>,
->;
-
-pub type ToClientConnection = Framed<
-    FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
-    (),
-    ServerAnswer,
-    Bincode<(), ServerAnswer>,
->;
-
-pub fn frame_servers_connection(
-    stream: TcpStream,
-) -> (FromClientConnection, ToClientConnection) {
-    let (reader, writer) = stream.into_split();
-    let stream = FramedRead::new(reader, LengthDelimitedCodec::new());
-    let sink = FramedWrite::new(writer, LengthDelimitedCodec::new());
-    (
-        FromClientConnection::new(stream, Bincode::default()),
-        ToClientConnection::new(sink, Bincode::default()),
-    )
 }

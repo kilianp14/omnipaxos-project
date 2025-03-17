@@ -2,6 +2,7 @@ use omnipaxos_sql::server::configs::OmniPaxosShardConfig;
 use crate::{database::Database, shard::OmniPaxosShard};
 use env_logger;
 use std::sync::Arc;
+use log::*;
 
 mod database;
 mod network;
@@ -18,6 +19,7 @@ pub async fn main() {
 
     let base_url = "postgres://postgres@localhost:5432"; // Base DB URL
     let db = Arc::new(Database::new(base_url).await);
+    info!("Starting up shard {} with id: {}", server_config.local.shard_id, server_config.local.server_id);
     let mut shard = OmniPaxosShard::new(server_config, db).await;
     shard.run().await;
 }

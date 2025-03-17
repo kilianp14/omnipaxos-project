@@ -1,0 +1,5 @@
+cluster_name = "coordinator-cluster"
+nodes = [1, 2, 3]
+node_addrs = ["127.0.0.1:10001", "127.0.0.1:10002", "127.0.0.1:10003"]
+initial_leader = 3
+initial_flexible_quorum = { read_quorum_size = 2, write_quorum_size = 2 }

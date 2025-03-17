@@ -175,36 +175,34 @@ impl OmniPaxosShard {
 
     async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         for command in commands {
-            let response: Result<String, DatabaseError> = match command.phase {
-                Phase::Prepare => {
-                    if let Some(sql_command) = command.sql_cmd.as_ref() {
-                        self.database.prepare_command(sql_command.clone(), command.command_id).await
-                    }
-                    else {
-                        Err(DatabaseError{message: "Empty Sql command".to_string()})
-                    }
-                },
-                Phase::Commit => self.database.commit_command(command.command_id).await,
-                Phase::Abort => self.database.abort_command(command.command_id).await,
-                Phase::Execute => {
-                    error!("Execute commands should not be in the log");
-                    continue;
-                }
-            };
-            if command.coordinator_id == self.id {
-                if let Phase::Prepare = command.phase {
-                    if let Some(sql_command) = command.sql_cmd.as_ref() {
-                        if let QueryType::Insert = sql_command.query_type {
-                            match response {
-                                Ok(_) => self.network.send_to_coordinator(ShardMessage::Ack(command.command_id)),
-                                Err(_) => self.network.send_to_coordinator(ShardMessage::Nack(command.command_id)),
-                            }
-                            return;
+            match command {
+                Command::Prepare(command_id, _, coordinator_id, sql_command) => {
+                    let response = self.database.prepare_command(sql_command, command_id).await;
+                    if coordinator_id == self.id {
+                        match response {
+                            Ok(_) => self.network.send_to_coordinator(ShardMessage::Ack(command_id)),
+                            // TODO: Proper error handling
+                            Err(_) => self.network.send_to_coordinator(ShardMessage::Nack(command_id)),
                         }
                     }
                 }
-                self.network.send_to_coordinator(ShardMessage::Answer(command.command_id, response));
-            }
+                Command::Commit(command_id, coordinator_id) => {
+                    let response = self.database.commit_command(command_id).await;
+                    if coordinator_id == self.id {
+                        self.network.send_to_coordinator(ShardMessage::Answer(command_id, response));
+                    }
+                }
+                Command::Abort(command_id, coordinator_id) => {
+                    let response = self.database.abort_command(command_id).await;
+                    if coordinator_id == self.id {
+                        self.network.send_to_coordinator(ShardMessage::Answer(command_id, response));
+                    }
+                }
+                _ => {
+                    error!("Weird message in the shard log");
+                    continue;
+                }
+            };
         }
     }
     
@@ -229,51 +227,36 @@ impl OmniPaxosShard {
 
     async fn handle_coordinator_messages(&mut self, messages: &mut Vec<CoordinatorMessage>) {
         for message in messages.drain(..) {
-            let command: Command;
-            match message {
-                CoordinatorMessage::Execute(cmd_id, sql_command) => {
+            match message.command {
+                Command::Execute(command_id, sql_command) => {
                     if matches!(sql_command.query_type, QueryType::Select) {
-                        self.handle_read_message(cmd_id, sql_command).await;
+                        self.handle_read_message(command_id, sql_command).await;
                     }
                     else {
                         let response = self.database.execute_command(sql_command).await;
-                        let msg = ShardMessage::Answer(cmd_id, response);
+                        let msg = ShardMessage::Answer(command_id, response);
                         self.network.send_to_coordinator(msg);
                     }
                     return;
                 }
-                CoordinatorMessage::Prepare(cmd_id, sql_command) => {
-                    command = Command {
-                        client_id: 0, // Shard does not care about clients, as coordinator tracks everything
-                        coordinator_id: self.id,
-                        command_id: cmd_id,
-                        sql_cmd: Some(sql_command),
-                        phase: Phase::Prepare,
-                    }
-                },
-                CoordinatorMessage::Commit(cmd_id) => {
-                    command = Command {
-                        client_id: 0,
-                        coordinator_id: self.id,
-                        command_id: cmd_id,
-                        sql_cmd: None,
-                        phase: Phase::Commit,
-                    }
-                },
-                CoordinatorMessage::Abort(cmd_id) => {
-                    command = Command {
-                        client_id: 0,
-                        coordinator_id: self.id,
-                        command_id: cmd_id,
-                        sql_cmd: None,
-                        phase: Phase::Abort,
-                    }
+                Command::Prepare(_, _, _, _) => {
+                    self.omnipaxos
+                        .append(message.command)
+                        .expect("Append to Omnipaxos log failed");
                 }
+                Command::Commit(_, _) => {
+                    self.omnipaxos
+                        .append(message.command)
+                        .expect("Append to Omnipaxos log failed");
+                }
+                Command::Abort(_, _) => {
+                    self.omnipaxos
+                        .append(message.command)
+                        .expect("Append to Omnipaxos log failed");
+                }
+                _ => {error!("Invalid message type from coordinator to shard")}
             }
-            self.omnipaxos
-                .append(command)
-                .expect("Append to Omnipaxos log failed");
-            }
+        }
     }
 
     async fn handle_read_message(&mut self, command_id: CommandId, sql_command: SqlCommand) {
@@ -318,4 +301,3 @@ impl OmniPaxosShard {
     }
 
 }
-

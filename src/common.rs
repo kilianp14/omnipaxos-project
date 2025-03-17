@@ -46,11 +46,8 @@ pub mod messages {
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub enum CoordinatorMessage {
-        Execute(CommandId, SqlCommand),
-        Prepare(CommandId, SqlCommand),
-        Commit(CommandId),
-        Abort(CommandId),
+    pub struct CoordinatorMessage {
+        pub command: Command,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,20 +81,13 @@ pub mod sql {
     pub type InstanceId = NodeId;
 
     #[derive(Debug, Clone, Entry, Serialize, Deserialize)]
-    pub struct Command {
-        pub client_id: ClientId,
-        pub coordinator_id: NodeId,
-        pub command_id: CommandId,
-        pub sql_cmd: Option<SqlCommand>,
-        pub phase: Phase,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub enum Phase {
-        Execute,
-        Prepare,
-        Commit,
-        Abort,
+    pub enum Command {
+        Execute(CommandId, SqlCommand),
+        Prepare(CommandId, ClientId, NodeId, SqlCommand),
+        Ack(CommandId, ShardId),
+        Nack(CommandId, ShardId),
+        Commit(CommandId, NodeId),
+        Abort(CommandId, NodeId),
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

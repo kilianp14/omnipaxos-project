@@ -7,48 +7,135 @@ x-common-variables: &common-server-variables
   OMNIPAXOS_LISTEN_PORT: 8000                     # Overwrite listen_port in server config TOMLs
 
 services:
-  s1:
-    image: omnipaxos-server
-    build:
-      context: ./..
-      dockerfile: server.dockerfile
-    container_name: s1
-    networks:
-      - backend
-    environment:
-      <<: *common-server-variables
-    volumes:
-      - ./server-1-config.toml:/app/server-config.toml
-      - ./cluster-config.toml:/app/cluster-config.toml
-      - ./logs/:/app/logs/
-  s2:
-    image: omnipaxos-server
-    container_name: s2
-    networks:
-      - backend
-    environment:
-      <<: *common-server-variables
-    volumes:
-      - ./server-2-config.toml:/app/server-config.toml
-      - ./cluster-config.toml:/app/cluster-config.toml
-      - ./logs/:/app/logs/
-  s3:
-    image: omnipaxos-server
-    container_name: s3
-    networks:
-      - backend
-    environment:
-      <<: *common-server-variables
-    volumes:
-      - ./server-3-config.toml:/app/server-config.toml
-      - ./cluster-config.toml:/app/cluster-config.toml
-      - ./logs/:/app/logs/
   c1:
-    image: omnipaxos-client
+    image: omnipaxos-coordinator
     build:
       context: ./..
-      dockerfile: client.dockerfile
+      dockerfile: coordinator.dockerfile
     container_name: c1
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./coordinator-1-config.toml:/app/server-config.toml
+      - ./coordinator-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  c2:
+    image: omnipaxos-coordinator
+    build:
+      context: ./..
+      dockerfile: coordinator.dockerfile
+    container_name: c2
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./coordinator-2-config.toml:/app/server-config.toml
+      - ./coordinator-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  c3:
+    image: omnipaxos-coordinator
+    build:
+      context: ./..
+      dockerfile: coordinator.dockerfile
+    container_name: c3
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./coordinator-3-config.toml:/app/server-config.toml
+      - ./coordinator-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  sh11:
+    image: omnipaxos-shard
+    build:
+      context: ./..
+      dockerfile: shard.dockerfile
+    container_name: sh11
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./shard1-1-config.toml:/app/server-config.toml
+      - ./shard1-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  sh12:
+    image: omnipaxos-shard
+    build:
+      context: ./..
+      dockerfile: shard.dockerfile
+    container_name: sh12
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./shard1-2-config.toml:/app/server-config.toml
+      - ./shard1-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  sh13:
+    image: omnipaxos-shard
+    build:
+      context: ./..
+      dockerfile: shard.dockerfile
+    container_name: sh13
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./shard1-3-config.toml:/app/server-config.toml
+      - ./shard1-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  sh21:
+    image: omnipaxos-shard
+    build:
+      context: ./..
+      dockerfile: shard.dockerfile
+    container_name: sh21
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./shard2-1-config.toml:/app/server-config.toml
+      - ./shard2-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  sh22:
+    image: omnipaxos-shard
+    build:
+      context: ./..
+      dockerfile: shard.dockerfile
+    container_name: sh22
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./shard2-2-config.toml:/app/server-config.toml
+      - ./shard2-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  sh23:
+    image: omnipaxos-shard
+    build:
+      context: ./..
+      dockerfile: shard.dockerfile
+    container_name: sh23
+    networks:
+      - backend
+    environment:
+      <<: *common-server-variables
+    volumes:
+      - ./shard2-3-config.toml:/app/server-config.toml
+      - ./shard2-cluster-config.toml:/app/cluster-config.toml
+      - ./logs/:/app/logs/
+  cl1:
+    image: omnipaxos-client
+    container_name: cl1
     networks:
       - backend
     environment:
@@ -58,18 +145,18 @@ services:
     volumes:
       - ./client-1-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/
-  # c2:
-  #   image: omnipaxos-client
-  #   container_name: c2
-  #   networks:
-  #     - backend
-  #   environment:
-  #     RUST_LOG: "debug"
-  #     CONFIG_FILE: "/app/client-config.toml"
-  #     OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
-  #   volumes:
-  #     - ./client-2-config.toml:/app/client-config.toml
-  #     - ./logs/:/app/logs/
+  cl2:
+    image: omnipaxos-client
+    container_name: cl2
+    networks:
+      - backend
+    environment:
+      RUST_LOG: "debug"
+      CONFIG_FILE: "/app/client-config.toml"
+      OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
+    volumes:
+      - ./client-2-config.toml:/app/client-config.toml
+      - ./logs/:/app/logs/
 
 networks:
   backend:

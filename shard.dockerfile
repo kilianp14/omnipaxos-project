@@ -21,7 +21,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Build application
 COPY . .
-RUN cargo build --release --bin server
+RUN cargo build --release --bin coordinator
 
 FROM debian:bookworm-slim AS runtime
     
@@ -41,7 +41,7 @@ RUN echo "local all all trust" > /etc/postgresql/15/main/pg_hba.conf && \
 RUN sed -i 's/^max_prepared_transactions = 0/max_prepared_transactions = 100/' /etc/postgresql/15/main/postgresql.conf
 
 WORKDIR /app    
-COPY --from=builder /app/target/release/server /usr/local/bin
+COPY --from=builder /app/target/release/coordinator /usr/local/bin
 EXPOSE 5432 8000
 
 # Did this as I coudn't copy a file `entrypoint.sh` into the `usr/local/bin` directory.
