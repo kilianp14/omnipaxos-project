@@ -1,4 +1,4 @@
-use crate::{database::Database, network::Network};
+use crate::{database::Database, network::NetworkTrait};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -18,7 +18,7 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct OmniPaxosShard {
     id: NodeId,
-    network: Network,
+    network: Box<dyn NetworkTrait>,
     database: Arc<Database>,
     omnipaxos: OmniPaxosInstance,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
@@ -29,13 +29,12 @@ pub struct OmniPaxosShard {
     
 
 impl OmniPaxosShard {
-    pub async fn new(config: OmniPaxosShardConfig, database: Arc<Database>) -> Self {
+    pub async fn new(config: OmniPaxosShardConfig, database: Arc<Database>, network: Box<dyn NetworkTrait>) -> Self {
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let peers = config.get_peers(config.local.server_id);
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.clone().build(storage).unwrap();
-        let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
 
         OmniPaxosShard {
             id: config.local.server_id,

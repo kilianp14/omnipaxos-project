@@ -1,10 +1,11 @@
-use crate::{coordinator::OmniPaxosCoordinator, network::Network};
+use omnipaxos_sql::server::configs::OmniPaxosCoordinatorConfig;
+use crate::{coordinator::OmniPaxosCoordinator, network::{NetworkTrait, Network}, network_test::NetworkTest};
 use env_logger;
 use log::*;
-use omnipaxos_sql::server::configs::OmniPaxosCoordinatorConfig;
 
-mod coordinator;
 mod network;
+mod network_test;
+mod coordinator;
 
 const NETWORK_BATCH_SIZE: usize = 100;
 
@@ -17,11 +18,16 @@ pub async fn main() {
         Err(e) => panic!("{e} while parsing coordinator config"),
     };
 
-    info!(
+    info!("Starting up coodinator: {}", server_config.local.server_id);    info!(
         "Starting up coordinator: {}, {}",
         server_config.local.server_id, server_config.local.listen_port
     );
-    let network = Box::new(Network::new(server_config.clone(), NETWORK_BATCH_SIZE).await);
+    let network: Box<dyn NetworkTrait> = if std::env::var("TESTING") == Result::Ok("TRUE".to_string()) {
+        info!("Running with a test network");
+        Box::new(NetworkTest::new(server_config.clone(), NETWORK_BATCH_SIZE).await)
+    } else {
+        Box::new(Network::new(server_config.clone(), NETWORK_BATCH_SIZE).await)
+    };
     let mut server = OmniPaxosCoordinator::new(server_config, network).await;
     server.run().await;
 }

@@ -1,4 +1,5 @@
 use futures::{SinkExt, StreamExt};
+use async_trait::async_trait;
 use log::*;
 use omnipaxos_sql::common::{
     messages::*,
@@ -14,6 +15,18 @@ use tokio::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use omnipaxos_sql::server::configs::OmniPaxosShardConfig;
+
+#[async_trait]
+pub trait NetworkTrait {
+    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage);
+    fn send_to_coordinator(&mut self, msg: ShardMessage);
+    async fn recv_many(
+        &mut self,
+        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
+        coordinator_msg_buf: &mut Vec<CoordinatorMessage>,
+        batch_size: usize,
+    );
+}
 
 pub struct Network {
     peers: Vec<NodeId>,
@@ -44,6 +57,60 @@ fn get_peer_addrs(config: OmniPaxosShardConfig) -> (SocketAddr, Vec<SocketAddr>)
         })
         .collect();
     (listen_address, node_addresses)
+}
+
+
+#[async_trait]
+impl NetworkTrait for Network {
+    fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
+        match self.cluster_id_to_idx(to) {
+            Some(idx) => match &mut self.peer_connections[idx] {
+                Some(ref mut connection) => {
+                    if let Err(err) = connection.send(msg) {
+                        warn!("Couldn't send msg to peer {to}: {err}");
+                        self.peer_connections[idx] = None;
+                    }
+                }
+                None => warn!("Not connected to node {to}"),
+            },
+            None => error!("Sending to unexpected node {to}"),
+        }
+    }
+
+    fn send_to_coordinator(&mut self, msg: ShardMessage) {
+        match &mut self.coordinator_connection {
+            Some(connection) => {
+                if let Err(err) = connection.send(msg) {
+                    warn!("Couldn't send msg to coordinator: {err}");
+                    self.coordinator_connection = None;
+                }
+            }
+            None => warn!("Not connected to coordinator"),
+        }
+    }
+
+    async fn recv_many(
+        &mut self,
+        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
+        coordinator_msg_buf: &mut Vec<CoordinatorMessage>,
+        batch_size: usize,
+    ) {
+        let mut timeout_interval = tokio::time::interval(Duration::from_millis(5));
+
+        while cluster_msg_buf.len() < batch_size || coordinator_msg_buf.len() < batch_size {
+            select! {
+                Some(msg) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
+                    cluster_msg_buf.push(msg);
+                }
+                Some(msg) = self.coordinator_messages.recv(), if coordinator_msg_buf.len() < batch_size => {
+                    coordinator_msg_buf.push(msg);
+                }
+                _ = timeout_interval.tick() => break,
+            }
+        }
+    }
+
+
 }
 
 impl Network {
@@ -223,55 +290,6 @@ impl Network {
                 let new_connection = NewConnection::ToPeer(peer_actor);
                 connection_sender.send(new_connection).await.unwrap();
             });
-        }
-    }
-
-
-    pub fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
-        match self.cluster_id_to_idx(to) {
-            Some(idx) => match &mut self.peer_connections[idx] {
-                Some(ref mut connection) => {
-                    if let Err(err) = connection.send(msg) {
-                        warn!("Couldn't send msg to peer {to}: {err}");
-                        self.peer_connections[idx] = None;
-                    }
-                }
-                None => warn!("Not connected to node {to}"),
-            },
-            None => error!("Sending to unexpected node {to}"),
-        }
-    }
-
-    pub fn send_to_coordinator(&mut self, msg: ShardMessage) {
-        match &mut self.coordinator_connection {
-            Some(connection) => {
-                if let Err(err) = connection.send(msg) {
-                    warn!("Couldn't send msg to coordinator: {err}");
-                    self.coordinator_connection = None;
-                }
-            }
-            None => warn!("Not connected to coordinator"),
-        }
-    }
-
-    pub async fn recv_many(
-        &mut self,
-        cluster_msg_buf: &mut Vec<(NodeId, ClusterMessage)>,
-        coordinator_msg_buf: &mut Vec<CoordinatorMessage>,
-        batch_size: usize,
-    ) {
-        let mut timeout_interval = tokio::time::interval(Duration::from_millis(5));
-
-        while cluster_msg_buf.len() < batch_size || coordinator_msg_buf.len() < batch_size {
-            select! {
-                Some(msg) = self.cluster_messages.recv(), if cluster_msg_buf.len() < batch_size => {
-                    cluster_msg_buf.push(msg);
-                }
-                Some(msg) = self.coordinator_messages.recv(), if coordinator_msg_buf.len() < batch_size => {
-                    coordinator_msg_buf.push(msg);
-                }
-                _ = timeout_interval.tick() => break,
-            }
         }
     }
 
