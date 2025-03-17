@@ -205,7 +205,7 @@ impl Network {
                             break connection;
                         }
                         Err(err) => {
-                            error!("Establishing connection to node {peer} failed: {err}")
+                            error!("Establishing connection to shard {peer}, {peer_address} failed: {err}")
                         }
                     }
                 };

@@ -348,7 +348,7 @@ impl Network {
                             break connection;
                         }
                         Err(err) => {
-                            error!("Establishing connection to node {peer} failed: {err}")
+                            error!("Establishing connection to coordinator {peer}, {peer_address} failed: {err}")
                         }
                     }
                 };
@@ -391,7 +391,7 @@ impl Network {
                             break connection;
                         }
                         Err(err) => {
-                            error!("Establishing connection to node {shard} failed: {err}")
+                            error!("Establishing connection to shard {shard}, {shard_address} failed: {err}")
                         }
                     }
                 };
