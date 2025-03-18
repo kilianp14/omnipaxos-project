@@ -1,5 +1,5 @@
 use omnipaxos_sql::common::{sql::{QueryType, SqlCommand, CommandId, ShardId, NodeId}, messages::DatabaseError};
-use sqlx::{Executor, PgPool};
+use sqlx::{Executor, PgPool, Row};
 use uuid::Uuid;
 
 pub struct Database {
@@ -92,26 +92,37 @@ impl Database {
                 .collect::<Vec<String>>()
                 .join(", ")
         };
-    
+        
         let query_str = format!(
             "SELECT {} FROM \"{}\" WHERE \"{}\" = ANY($1)",
             columns, command.table, command.columns[0].0
         );
     
-        let rows: Vec<(i64,)> = sqlx::query_as(&query_str)
+        let rows = sqlx::query(&query_str)
             .bind(command.keys.unwrap())
             .fetch_all(&self.pool)
             .await?;
     
         if rows.is_empty() {
-            return Err(DatabaseError{message: "Rows not found".to_string()});
+            return Ok("".to_string());
         }
-    
+
         let result = rows
-            .into_iter()
-            .map(|(value,)| value.to_string())
+            .iter()
+            .map(|row| {
+                let values: Vec<String> = command.columns.iter().enumerate().map(|(i, (_, col_type))| {
+                    match col_type.as_str() {
+                        "text" | "varchar" | "char" => row.get::<String, _>(i),
+                        "int4" | "int8" | "bigint" | "integer" => row.get::<i64, _>(i).to_string(),
+                        "float4" | "float8" | "real" | "double precision" => row.get::<f64, _>(i).to_string(),
+                        "bool" => row.get::<bool, _>(i).to_string(),
+                        _ => "UNKNOWN".to_string(),
+                    }
+                }).collect();
+                values.join(", ") // Join columns with a comma
+            })
             .collect::<Vec<String>>()
-            .join(", ");
+            .join("; ");
     
         Ok(result)
     }

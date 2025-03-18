@@ -186,7 +186,7 @@ impl OmniPaxosCoordinator {
                             for shard_id in involved_shards {
                                 self.network.send_to_shard(*shard_id, CoordinatorMessage{command: Command::Commit(command_id.clone(), coordinator_id)});
                             }
-                            self.network.send_to_client(*client_id, ServerMessage::Answer(command_id.clone(), answers.join(",")));
+                            self.network.send_to_client(*client_id, ServerMessage::Answer(command_id.clone(), answers.join(";")));
                         }
                         self.pending_transactions.remove(&command_id);
                     }
@@ -206,6 +206,7 @@ impl OmniPaxosCoordinator {
                     self.pending_transactions.remove(&command_id);
                 },
                 Command::Ack(command_id, coordinator_id, answer) => {
+                    info!("Ack to {}: {}", command_id, answer);
                     if let Some((_, involved_shards, answers)) = self.pending_transactions.get_mut(&command_id) {
                         answers.push(answer);
                         if answers.len() == involved_shards.len() && self.id == coordinator_id {
@@ -310,17 +311,16 @@ impl OmniPaxosCoordinator {
                         Some((client_id, expected_acks, results)) => {
                             results.push(result);
                             if results.len() == *expected_acks {
-                                let mut response: String = String::new();
+                                let mut answers: Vec<String> = Vec::with_capacity(*expected_acks);
                                 for result in results {
                                     match result {
-                                        Ok(str) => response.push_str(str),
+                                        Ok(str) => answers.push(str.clone()),
                                         Err(err) => {
-                                            response = format!("Internal Error: {}", err.message);
-                                            break;
+                                            answers.push(format!("Internal Error: {}", err.message));
                                         }
                                     }
                                 }
-                                self.network.send_to_client(*client_id, ServerMessage::Answer(command_id.clone(), response));
+                                self.network.send_to_client(*client_id, ServerMessage::Answer(command_id.clone(), answers.join(";")));
                                 self.pending_executions.remove(&command_id);
                             }
                         }

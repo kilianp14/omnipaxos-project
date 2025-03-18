@@ -147,7 +147,7 @@ impl Client {
             // TODO use different consistency levels for reads.
             _ => {
                 let random_value = self.rng.gen::<f64>();
-                let keys = vec![prev_key, key + 100];
+                let keys = vec![prev_key, prev_key + 100];
                 if random_value > 0.6 {
                     SqlCommand::select_cmd(keys, Consistency::Local)
                 }

@@ -1,7 +1,7 @@
 use crate::network::{Network, TesterMessage, ServerAnswer};
 use std::process::{Command, Child};
 use std::sync::{Arc, Mutex};
-use std::{fs, thread, time};
+use std::{fs, thread, time, vec};
 use std::path::Path;
 use ctrlc;
 use omnipaxos_sql::common::{
@@ -54,7 +54,7 @@ async fn main() {
         let coordinator_config_path = format!("./testing_configs/coordinator-{}-config.toml", i);
         let child = Command::new("cargo")
             .args(&["run", "--bin", "coordinator"])
-            .env("RUST_LOG", "debug")
+            .env("RUST_LOG", "info")
             .env("SERVER_CONFIG_FILE", &coordinator_config_path)
             .env("CLUSTER_CONFIG_FILE", &coordinator_cluster_path)
             .env("TESTING", "TRUE")
@@ -68,7 +68,7 @@ async fn main() {
             let shard_config_path = format!("./testing_configs/shard{}-{}-config.toml", j, i);
             let child = Command::new("cargo")
                 .args(&["run", "--bin", "shard"])
-                .env("RUST_LOG", "debug")
+                .env("RUST_LOG", "info")
                 .env("SERVER_CONFIG_FILE", &shard_config_path)
                 .env("CLUSTER_CONFIG_FILE", &shard_cluster_path)
                 .env("TESTING", "TRUE")
@@ -117,8 +117,54 @@ async fn main() {
             None => error!("Connection closed")
         }
     }
+    thread::sleep(time::Duration::from_secs(5)); 
 
-    thread::sleep(time::Duration::from_secs(3)); 
+    info!("Test local read");
+    let id = Uuid::new_v4().to_string();
+    info!("Sent insert command [(1, 4), (101, 5)] with id {}", id);
+    network.send(1, 1, TesterMessage::Disconnect(2)).await;
+    network.send(1, 1, TesterMessage::Disconnect(3)).await;
+    network.send(3, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::insert_cmd(vec![1, 101], vec!["4".to_string(), "5".to_string()])))).await;
+    for _ in 0..15 {
+        let msg = network.server_messages.recv().await;
+        match msg {
+            Some(ServerAnswer::Decide(sender_id, receiver_id, receiver_shard, decide_msg)) => {
+                info!("Decide from {} to {} (shard: {})", sender_id, receiver_id, receiver_shard);
+                network.send(receiver_id, receiver_shard, TesterMessage::ClusterMessage(decide_msg, sender_id)).await;
+            },
+            Some(ServerAnswer::ServerMessage(ServerMessage::Answer(cmd_id, answer_msg))) => {
+                info!("Got answer to command {}: {}", cmd_id, answer_msg);
+            },
+            Some(ServerAnswer::ServerMessage(ServerMessage::StartSignal(_))) => info!("Coordinator received start signal"),
+            None => error!("Connection closed")
+        }
+    }
+
+    thread::sleep(time::Duration::from_secs(5)); 
+
+    let id = Uuid::new_v4().to_string();
+    info!("Reading keys (1, 101) locally from node 2 with id {}", id);
+    network.send(
+        2, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![1, 101], Consistency::Local)))
+    ).await;
+    let msg = network.server_messages.recv().await;
+    if let Some(ServerAnswer::ServerMessage(ServerMessage::Answer(cmd_id, am))) = msg {
+        info!("Got answer from node 2 with id {}: {}", cmd_id, am);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    info!("Reading keys (1, 101) locally from node 1 with id {}", id);
+    network.send(
+        1, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![1, 101], Consistency::Local)))
+    ).await;
+    let msg = network.server_messages.recv().await;
+    if let Some(ServerAnswer::ServerMessage(ServerMessage::Answer(cmd_id, am))) = msg {
+        info!("Got answer from node 1 with id {}: {}", cmd_id, am);
+    }
+
+    network.send(1, 1, TesterMessage::Reconnect(2)).await;
+    network.send(1, 1, TesterMessage::Reconnect(3)).await;
+
     // Clean up
     network.shutdown();
     let mut processes = children.lock().unwrap();
