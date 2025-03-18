@@ -1,12 +1,11 @@
 use std::env;
 
+use crate::common::sql::{NodeId, ShardId};
 use config::{Config, ConfigError, Environment, File};
 use omnipaxos::{
-    util::FlexibleQuorum,
-    ClusterConfig as OmnipaxosClusterConfig, OmniPaxosConfig,
+    util::FlexibleQuorum, ClusterConfig as OmnipaxosClusterConfig, OmniPaxosConfig,
     ServerConfig as OmnipaxosServerConfig,
 };
-use crate::common::sql::{NodeId, ShardId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -92,6 +91,7 @@ impl OmniPaxosCoordinatorConfig {
                 Environment::with_prefix("OMNIPAXOS")
                     .try_parsing(true)
                     .list_separator(",")
+                    .with_list_parse_key("shard_addrs")
                     .with_list_parse_key("node_addrs"),
             )
             .build()?;

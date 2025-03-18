@@ -40,7 +40,9 @@ RUN echo "local all all trust" > /etc/postgresql/15/main/pg_hba.conf && \
     echo "host all all 127.0.0.1/32 trust" >> /etc/postgresql/15/main/pg_hba.conf && \
     echo "host all all ::1/128 trust" >> /etc/postgresql/15/main/pg_hba.conf
 
-RUN sed -i 's/^max_prepared_transactions = 0/max_prepared_transactions = 100/' /etc/postgresql/15/main/postgresql.conf
+# Remove max_prepared_transactions from the configuration file if exists, then add it back with a new value.
+RUN sed -i '/^#\?max_prepared_transactions/d' /etc/postgresql/15/main/postgresql.conf && \
+    echo "max_prepared_transactions = 100" >> /etc/postgresql/15/main/postgresql.conf
 
 WORKDIR /app
 COPY --from=builder /app/target/release/shard /usr/local/bin
