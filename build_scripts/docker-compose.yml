@@ -9,6 +9,11 @@ x-common-variables: &common-server-variables
 services:
   # Coordinators
   c1:
+#    depends_on:
+#      sh11:
+#        condition: service_healthy
+#      sh21:
+#        condition: service_healthy
     image: omnipaxos-coordinator
     container_name: c1
     build:
@@ -18,13 +23,18 @@ services:
       - backend
     environment:
       <<: *common-server-variables
-#      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000, sh11:8000,sh12:8000,sh13:8000, sh21:8000,sh22:8000,sh23:8000"
       OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000"
+      OMNIPAXOS_SHARD_ADDRS: "sh11:8000,sh21:8000"
     volumes:
       - ./coordinator-1-config.toml:/app/server-config.toml
       - ./coordinator-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
   c2:
+#    depends_on:
+#      sh12:
+#        condition: service_healthy
+#      sh22:
+#        condition: service_healthy
     image: omnipaxos-coordinator
     container_name: c2
     build:
@@ -34,14 +44,18 @@ services:
       - backend
     environment:
       <<: *common-server-variables
-#      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000, sh11:8000,sh12:8000,sh13:8000, sh21:8000,sh22:8000,sh23:8000"
       OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000"
+      OMNIPAXOS_SHARD_ADDRS: "sh12:8000,sh22:8000"
     volumes:
       - ./coordinator-2-config.toml:/app/server-config.toml
       - ./coordinator-cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
 
   c3:
+#    depends_on:
+#      sh13:
+#        condition: service_healthy
+#      sh23:
     image: omnipaxos-coordinator
     container_name: c3
     build:
@@ -51,8 +65,8 @@ services:
       - backend
     environment:
       <<: *common-server-variables
-#      OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000, sh11:8000,sh12:8000,sh13:8000, sh21:8000,sh22:8000,sh23:8000"
       OMNIPAXOS_NODE_ADDRS: "c1:8000,c2:8000,c3:8000"
+      OMNIPAXOS_SHARD_ADDRS: "sh13:8000,sh23:8000"
     volumes:
       - ./coordinator-3-config.toml:/app/server-config.toml
       - ./coordinator-cluster-config.toml:/app/cluster-config.toml
@@ -69,6 +83,7 @@ services:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_LISTEN_PORT: 8000
       OMNIPAXOS_NODE_ADDRS: "sh11:8000,sh12:8000,sh13:8000"
     volumes:
       - ./shard1-1-config.toml:/app/server-config.toml
@@ -76,6 +91,11 @@ services:
       - ./logs/:/app/logs/
 
   sh12:
+#    healthcheck:
+#      test: ["CMD", "nc", "-z", "localhost", "8000"]
+#      interval: 5s
+#      retries: 10
+#      start_period: 5s
     image: omnipaxos-shard
     container_name: sh12
     build:
@@ -85,6 +105,7 @@ services:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_LISTEN_PORT: 8000
       OMNIPAXOS_NODE_ADDRS: "sh11:8000,sh12:8000,sh13:8000"
     volumes:
       - ./shard1-2-config.toml:/app/server-config.toml
@@ -92,6 +113,11 @@ services:
       - ./logs/:/app/logs/
 
   sh13:
+#    healthcheck:
+#      test: ["CMD", "nc", "-z", "localhost", "8000"]
+#      interval: 5s
+#      retries: 10
+#      start_period: 5s
     image: omnipaxos-shard
     container_name: sh13
     build:
@@ -101,6 +127,7 @@ services:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_LISTEN_PORT: 8000
       OMNIPAXOS_NODE_ADDRS: "sh11:8000,sh12:8000,sh13:8000"
     volumes:
       - ./shard1-3-config.toml:/app/server-config.toml
@@ -109,6 +136,11 @@ services:
 
   # Shards Group 2 (second shard of each partition)
   sh21:
+#    healthcheck:
+#      test: ["CMD", "nc", "-z", "localhost", "8000"]
+#      interval: 5s
+#      retries: 10
+#      start_period: 5s
     image: omnipaxos-shard
     container_name: sh21
     build:
@@ -118,6 +150,7 @@ services:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_LISTEN_PORT: 8000
       OMNIPAXOS_NODE_ADDRS: "sh21:8000,sh22:8000,sh23:8000"
     volumes:
       - ./shard2-1-config.toml:/app/server-config.toml
@@ -126,6 +159,11 @@ services:
 
   sh22:
     image: omnipaxos-shard
+#    healthcheck:
+#      test: ["CMD", "nc", "-z", "localhost", "8000"]
+#      interval: 5s
+#      retries: 10
+#      start_period: 5s
     container_name: sh22
     build:
       context: ./..
@@ -134,6 +172,7 @@ services:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_LISTEN_PORT: 8000
       OMNIPAXOS_NODE_ADDRS: "sh21:8000,sh22:8000,sh23:8000"
     volumes:
       - ./shard2-2-config.toml:/app/server-config.toml
@@ -142,6 +181,11 @@ services:
 
   sh23:
     image: omnipaxos-shard
+#    healthcheck:
+#      test: ["CMD", "nc", "-z", "localhost", "8000"]
+#      interval: 5s
+#      retries: 10
+#      start_period: 5s
     container_name: sh23
     build:
       context: ./..
@@ -150,6 +194,7 @@ services:
       - backend
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_LISTEN_PORT: 8000
       OMNIPAXOS_NODE_ADDRS: "sh21:8000,sh22:8000,sh23:8000"
     volumes:
       - ./shard2-3-config.toml:/app/server-config.toml
@@ -158,6 +203,8 @@ services:
 
   # Clients
   cl1:
+    depends_on:
+      - c1
     image: omnipaxos-client
     container_name: cl1
     build:
@@ -174,6 +221,8 @@ services:
       - ./logs/:/app/logs/
 
   cl2:
+    depends_on:
+      - c2
     image: omnipaxos-client
     container_name: cl2
     build:
@@ -191,4 +240,5 @@ services:
 
 networks:
   backend:
+    name: backend
     driver: bridge
