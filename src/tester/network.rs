@@ -14,12 +14,6 @@ use serde::{Serialize, Deserialize};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ServerAnswer {
-    ServerMessage(ServerMessage),
-    Decide(NodeId, NodeId, ShardId, ClusterMessage),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TesterMessage {
     ClientMessage(ClientMessage),
     ClusterMessage(ClusterMessage, NodeId),
@@ -29,8 +23,8 @@ pub enum TesterMessage {
 
 pub struct Network {
     server_connections: Vec<Option<ServerConnection>>,
-    server_message_sender: Sender<ServerAnswer>,
-    pub server_messages: Receiver<ServerAnswer>,
+    server_message_sender: Sender<ServerMessage>,
+    pub server_messages: Receiver<ServerMessage>,
     batch_size: usize,
     n_shards: u64,
 }
@@ -154,7 +148,7 @@ impl ServerConnection {
         reader: FromServerConnection,
         mut writer: ToServerConnection,
         batch_size: usize,
-        incoming_messages: Sender<ServerAnswer>,
+        incoming_messages: Sender<ServerMessage>,
     ) -> Self {
         // Reader Actor
         let reader_task = tokio::spawn(async move {
@@ -221,9 +215,9 @@ pub fn frame_registration_connection(stream: TcpStream) -> RegistrationConnectio
 
 pub type FromServerConnection = Framed<
     FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
-    ServerAnswer,
+    ServerMessage,
     (),
-    Bincode<ServerAnswer, ()>,
+    Bincode<ServerMessage, ()>,
 >;
 
 pub type ToServerConnection = Framed<

@@ -206,7 +206,7 @@ impl OmniPaxosCoordinator {
                     self.pending_transactions.remove(&command_id);
                 },
                 Command::Ack(command_id, coordinator_id, answer) => {
-                    info!("Ack to {}: {}", command_id, answer);
+                    debug!("Ack to {}: {}", command_id, answer);
                     if let Some((_, involved_shards, answers)) = self.pending_transactions.get_mut(&command_id) {
                         answers.push(answer);
                         if answers.len() == involved_shards.len() && self.id == coordinator_id {
@@ -218,6 +218,7 @@ impl OmniPaxosCoordinator {
                     }
                 }
                 Command::Nack(command_id, coordinator_id) => {
+                    warn!("Command has to be aborted: {}", command_id);
                     if let Some((_, _, _)) = self.pending_transactions.get(&command_id) {
                         if self.id == coordinator_id {
                             self.omnipaxos

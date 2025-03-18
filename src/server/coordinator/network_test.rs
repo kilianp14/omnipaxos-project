@@ -6,7 +6,6 @@ use omnipaxos_sql::common::{
     sql::{ClientId, NodeId, ShardId},
     utils::*,
 };
-use omnipaxos::messages::{Message, sequence_paxos::{PaxosMessage, PaxosMsg, Decide}};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
@@ -24,11 +23,6 @@ use omnipaxos_sql::server::configs::OmniPaxosCoordinatorConfig;
 use serde::{Serialize, Deserialize};
 use crate::network::NetworkTrait;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ServerAnswer {
-    ServerMessage(ServerMessage),
-    Decide(NodeId, NodeId, ShardId, ClusterMessage),
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TesterMessage {
@@ -39,7 +33,6 @@ pub enum TesterMessage {
 }
 
 pub struct NetworkTest {
-    node_id: NodeId,
     peers: Vec<NodeId>,
     shards: Vec<ShardId>,
     peer_connections: Vec<Option<PeerConnection>>,
@@ -94,19 +87,6 @@ impl NetworkTrait for NetworkTest {
         if let Some((sending, _)) = self.disconnected.get_mut(&to) {
             sending.push(msg);
         }
-        else if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
-            PaxosMessage { from: _, to: node_id, msg: PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) }
-        )) = msg {
-            match &mut self.tester_connection {
-                Some(ref mut connection) => {
-                    if let Err(err) = connection.send(ServerAnswer::Decide(self.node_id, node_id, 0, msg)) {
-                        warn!("Couldn't send msg to tester: {err}");
-                        self.tester_connection = None;
-                    }
-                }
-                None => warn!("Not connected to tester"),
-            }
-        }
         else {
             match self.cluster_id_to_idx(to) {
                 Some(idx) => match &mut self.peer_connections[idx] {
@@ -126,7 +106,7 @@ impl NetworkTrait for NetworkTest {
     fn send_to_client(&mut self, _: ClientId, msg: ServerMessage) {
         match &mut self.tester_connection {
             Some(connection) => {
-                if let Err(err) = connection.send(ServerAnswer::ServerMessage(msg)) {
+                if let Err(err) = connection.send(msg) {
                     warn!("Couldn't send msg to tester: {err}");
                     self.tester_connection = None;
                 }
@@ -233,7 +213,6 @@ impl NetworkTest {
         let (shard_message_sender, shard_messages) = tokio::sync::mpsc::channel(batch_size);
         let (tester_message_sender, tester_messages) = tokio::sync::mpsc::channel(batch_size);
         let mut network = Self {
-            node_id: config.local.server_id,
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             shards: shard_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
@@ -638,7 +617,7 @@ impl ShardConnection {
 struct TesterConnection {
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
-    outgoing_messages: UnboundedSender<ServerAnswer>,
+    outgoing_messages: UnboundedSender<ServerMessage>,
 }
 
 impl TesterConnection {
@@ -688,8 +667,8 @@ impl TesterConnection {
 
     pub fn send(
         &mut self,
-        msg: ServerAnswer,
-    ) -> Result<(), mpsc::error::SendError<ServerAnswer>> {
+        msg: ServerMessage,
+    ) -> Result<(), mpsc::error::SendError<ServerMessage>> {
         self.outgoing_messages.send(msg)
     }
 
@@ -709,8 +688,8 @@ pub type FromTesterConnection = Framed<
 pub type ToTesterConnection = Framed<
     FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
     (),
-    ServerAnswer,
-    Bincode<(), ServerAnswer>,
+    ServerMessage,
+    Bincode<(), ServerMessage>,
 >;
 
 pub fn frame_to_tester_connection(

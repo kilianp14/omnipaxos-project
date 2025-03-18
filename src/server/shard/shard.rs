@@ -195,7 +195,11 @@ impl OmniPaxosShard {
                 }
                 Command::Abort(command_id, _) => {
                     // TODO: Proper error handling
-                    let _ = self.database.abort_command(command_id.clone(), self.id, self.shard_id).await;
+                    let res = self.database.abort_command(command_id.clone(), self.id, self.shard_id).await;
+                    match res {
+                        Ok(msg) => debug!("{}", msg),
+                        Err(db_error) => error!("Abortion of transaction {}_{}_{} failed: {}", command_id, self.id, self.shard_id, db_error.message),
+                    }
                 }
                 _ => {
                     error!("Weird message in the shard log");

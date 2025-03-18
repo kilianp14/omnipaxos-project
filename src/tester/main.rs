@@ -1,4 +1,4 @@
-use crate::network::{Network, TesterMessage, ServerAnswer};
+use crate::network::{Network, TesterMessage};
 use std::process::{Command, Child};
 use std::sync::{Arc, Mutex};
 use std::{fs, thread, time, vec};
@@ -103,44 +103,33 @@ async fn main() {
     let id = Uuid::new_v4().to_string();
     info!("Sent create table command with id {}", id);
     network.send(3, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::create_table_cmd()))).await;
-    for _ in 0..15 {
-        let msg = network.server_messages.recv().await;
-        match msg {
-            Some(ServerAnswer::Decide(sender_id, receiver_id, receiver_shard, decide_msg)) => {
-                info!("Decide from {} to {} (shard: {})", sender_id, receiver_id, receiver_shard);
-                network.send(receiver_id, receiver_shard, TesterMessage::ClusterMessage(decide_msg, sender_id)).await;
-            },
-            Some(ServerAnswer::ServerMessage(ServerMessage::Answer(cmd_id, answer_msg))) => {
-                info!("Got answer to command {}: {}", cmd_id, answer_msg);
-            },
-            Some(ServerAnswer::ServerMessage(ServerMessage::StartSignal(_))) => info!("Coordinator received start signal"),
-            None => error!("Connection closed")
-        }
+    let msg = network.server_messages.recv().await;
+    match msg {
+        Some(ServerMessage::Answer(cmd_id, answer_msg)) => {
+            info!("Got answer to command {}: {}", cmd_id, answer_msg);
+        },
+        Some(ServerMessage::StartSignal(_)) => info!("Coordinator received start signal"),
+        None => error!("Connection closed")
     }
-    thread::sleep(time::Duration::from_secs(5)); 
+    thread::sleep(time::Duration::from_secs(2)); 
 
     info!("Test local read");
     let id = Uuid::new_v4().to_string();
-    info!("Sent insert command [(1, 4), (101, 5)] with id {}", id);
+    info!("Disconnect first instance of shard 1 from its RSM");
     network.send(1, 1, TesterMessage::Disconnect(2)).await;
     network.send(1, 1, TesterMessage::Disconnect(3)).await;
+    info!("Sent insert command [(1, 4), (101, 5)] with id {}", id);
     network.send(3, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::insert_cmd(vec![1, 101], vec!["4".to_string(), "5".to_string()])))).await;
-    for _ in 0..15 {
-        let msg = network.server_messages.recv().await;
-        match msg {
-            Some(ServerAnswer::Decide(sender_id, receiver_id, receiver_shard, decide_msg)) => {
-                info!("Decide from {} to {} (shard: {})", sender_id, receiver_id, receiver_shard);
-                network.send(receiver_id, receiver_shard, TesterMessage::ClusterMessage(decide_msg, sender_id)).await;
-            },
-            Some(ServerAnswer::ServerMessage(ServerMessage::Answer(cmd_id, answer_msg))) => {
-                info!("Got answer to command {}: {}", cmd_id, answer_msg);
-            },
-            Some(ServerAnswer::ServerMessage(ServerMessage::StartSignal(_))) => info!("Coordinator received start signal"),
-            None => error!("Connection closed")
-        }
+    let msg = network.server_messages.recv().await;
+    match msg {
+        Some(ServerMessage::Answer(cmd_id, answer_msg)) => {
+            info!("Got answer to command {}: {}", cmd_id, answer_msg);
+        },
+        Some(ServerMessage::StartSignal(_)) => info!("Coordinator received start signal"),
+        None => error!("Connection closed")
     }
 
-    thread::sleep(time::Duration::from_secs(5)); 
+    thread::sleep(time::Duration::from_secs(2)); 
 
     let id = Uuid::new_v4().to_string();
     info!("Reading keys (1, 101) locally from node 2 with id {}", id);
@@ -148,7 +137,7 @@ async fn main() {
         2, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![1, 101], Consistency::Local)))
     ).await;
     let msg = network.server_messages.recv().await;
-    if let Some(ServerAnswer::ServerMessage(ServerMessage::Answer(cmd_id, am))) = msg {
+    if let Some(ServerMessage::Answer(cmd_id, am)) = msg {
         info!("Got answer from node 2 with id {}: {}", cmd_id, am);
     }
 
@@ -158,12 +147,88 @@ async fn main() {
         1, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![1, 101], Consistency::Local)))
     ).await;
     let msg = network.server_messages.recv().await;
-    if let Some(ServerAnswer::ServerMessage(ServerMessage::Answer(cmd_id, am))) = msg {
+    if let Some(ServerMessage::Answer(cmd_id, am)) = msg {
         info!("Got answer from node 1 with id {}: {}", cmd_id, am);
     }
 
     network.send(1, 1, TesterMessage::Reconnect(2)).await;
     network.send(1, 1, TesterMessage::Reconnect(3)).await;
+
+
+
+    info!("Test leader vs. linearizable");
+    let id = Uuid::new_v4().to_string();
+    info!("Disconnect entire cluster 3 (all leaders) from their RSMs");
+    network.send(3, 0, TesterMessage::Disconnect(1)).await;
+    network.send(3, 0, TesterMessage::Disconnect(2)).await;
+    network.send(3, 1, TesterMessage::Disconnect(1)).await;
+    network.send(3, 1, TesterMessage::Disconnect(2)).await;
+    network.send(3, 2, TesterMessage::Disconnect(1)).await;
+    network.send(3, 2, TesterMessage::Disconnect(2)).await;
+
+    info!("Wait for leader changes");
+    thread::sleep(time::Duration::from_secs(30));
+
+    info!("Sent insert command [(2, 6), (102, 7)] with id {} to new coordinator leader", id);
+    network.send(2, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::insert_cmd(vec![2, 102], vec!["6".to_string(), "7".to_string()])))).await;
+
+    let msg = network.server_messages.recv().await;
+    if let Some(ServerMessage::Answer(cmd_id, am)) = msg {
+        info!("Got answer from node 2 with id {}: {}", cmd_id, am);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    info!("Doing linearizable read for keys (2, 102) on node 1 with id {}: ", id);
+    network.send(
+        1, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![2, 102], Consistency::Linearizable)))
+    ).await;
+    let msg = network.server_messages.recv().await;
+    if let Some(ServerMessage::Answer(cmd_id, am)) = msg {
+        info!("Got answer from node 1 with id {}: {}", cmd_id, am);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    info!("Doing leader read for keys (2, 102) on old leader(3) with id {}: ", id);
+    network.send(
+        3, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![2, 102], Consistency::Leader)))
+    ).await;
+    let msg = network.server_messages.recv().await;
+    if let Some(ServerMessage::Answer(cmd_id, am)) = msg {
+        info!("Got answer from node 3 with id {}: {}", cmd_id, am);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    info!("Doing linearizable read for keys (2, 102) on old leader(3) with id {}: ", id);
+    network.send(
+        3, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![2, 102], Consistency::Linearizable)))
+    ).await;
+    thread::sleep(time::Duration::from_secs(10));
+    match network.server_messages.try_recv() {
+        Ok(_) => error!("Old leader actually returned an answer. Would be not linearizable"),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => info!("No answer, as node cant perform a linearizable read when disconnected from others"),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => error!("Something went really wrong"),
+    }
+
+    info!("Reconnecting node 3");
+    network.send(3, 0, TesterMessage::Reconnect(1)).await;
+    network.send(3, 0, TesterMessage::Reconnect(2)).await;
+    network.send(3, 1, TesterMessage::Reconnect(1)).await;
+    network.send(3, 1, TesterMessage::Reconnect(2)).await;
+    network.send(3, 2, TesterMessage::Reconnect(1)).await;
+    network.send(3, 2, TesterMessage::Reconnect(2)).await;
+
+    thread::sleep(time::Duration::from_secs(10));
+
+    let id = Uuid::new_v4().to_string();
+    info!("Retrying linearizable read for keys (2, 102) on old leader(3) with id {}: ", id);
+    network.send(
+        3, 0, TesterMessage::ClientMessage(ClientMessage::Handle(id, SqlCommand::select_cmd(vec![2, 102], Consistency::Linearizable)))
+    ).await;
+    let msg = network.server_messages.recv().await;
+    if let Some(ServerMessage::Answer(cmd_id, am)) = msg {
+        info!("Got answer from node 3 with id {}: {}", cmd_id, am);
+    }
+
 
     // Clean up
     network.shutdown();
@@ -197,6 +262,10 @@ fn drop_postgres_databases() {
     for db in databases.lines() {
         let db = db.trim();
         if !db.is_empty() {
+            let _ = Command::new("psql")
+                .args(&["-U", "postgres", "-d", db, "-c",
+                        &format!("ROLLBACK;")])
+                .status();
             println!("Checking for prepared transactions in: {}", db);
 
             // Abort any prepared transactions associated with this database

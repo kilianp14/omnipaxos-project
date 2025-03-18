@@ -1,3 +1,4 @@
+use log::info;
 use omnipaxos_sql::common::{sql::{QueryType, SqlCommand, CommandId, ShardId, NodeId}, messages::DatabaseError};
 use sqlx::{Executor, PgPool, Row};
 use uuid::Uuid;
@@ -39,14 +40,28 @@ impl Database {
         let commit_query = format!("COMMIT PREPARED '{}_{}_{}'", transaction_id, node_id, shard_id);
         sqlx::query(&commit_query).execute(&self.pool).await?;
     
-        Ok(format!("Committed Transaction {}", transaction_id))
+        Ok(format!("Committed Transaction {}_{}_{}", transaction_id, node_id, shard_id))
     }
     
     pub async fn abort_command(&self, transaction_id: CommandId, node_id: NodeId, shard_id: ShardId) -> Result<String, DatabaseError> {
-        let abort_query = format!("ROLLBACK PREPARED '{}_{}_{}'", transaction_id, node_id, shard_id);
-        sqlx::query(&abort_query).execute(&self.pool).await?;
+        info!("Aborting transaction {}_{}_{}", transaction_id, node_id, shard_id);
+
+        let _ = sqlx::query("ROLLBACK").execute(&self.pool).await;
+
+        let check_query = format!(
+            "SELECT gid FROM pg_prepared_xacts WHERE gid = '{}_{}_{}'",
+            transaction_id, node_id, shard_id
+        );
+        let exists = sqlx::query_scalar::<_, String>(&check_query)
+            .fetch_optional(&self.pool)
+            .await?;
+        
+        if exists.is_some() {
+            let abort_query = format!("ROLLBACK PREPARED '{}_{}_{}'", transaction_id, node_id, shard_id);
+            sqlx::query(&abort_query).execute(&self.pool).await?;
+        }
     
-        Ok(format!("Aborted Transaction {}", transaction_id))
+        Ok(format!("Aborted Transaction {}_{}_{}", transaction_id, node_id, shard_id))
     }
 
     pub async fn prepare_command(

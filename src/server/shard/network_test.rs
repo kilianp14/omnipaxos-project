@@ -3,10 +3,9 @@ use async_trait::async_trait;
 use log::*;
 use omnipaxos_sql::common::{
     messages::*,
-    sql::{NodeId, ShardId},
+    sql::NodeId,
     utils::*,
 };
-use omnipaxos::messages::{Message, sequence_paxos::{PaxosMessage, PaxosMsg, Decide}};
 use std::{net::{SocketAddr, ToSocketAddrs}, time::Duration, str::FromStr, collections::HashMap};
 use tokio::{select, sync::mpsc::{Sender, UnboundedSender}};
 use tokio::{
@@ -21,11 +20,6 @@ use serde::{Serialize, Deserialize};
 use crate::network::NetworkTrait;
 use omnipaxos_sql::server::configs::OmniPaxosShardConfig;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ServerAnswer {
-    ServerMessage(ServerMessage),
-    Decide(NodeId, NodeId, ShardId, ClusterMessage),
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TesterMessage {
@@ -36,8 +30,6 @@ pub enum TesterMessage {
 }
 
 pub struct NetworkTest {
-    node_id: NodeId,
-    shard_id: ShardId,
     peers: Vec<NodeId>,
     peer_connections: Vec<Option<PeerConnection>>,
     coordinator_connection: Option<CoordinatorConnection>,
@@ -79,19 +71,6 @@ impl NetworkTrait for NetworkTest {
     fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
         if let Some((sending, _)) = self.disconnected.get_mut(&to) {
             sending.push(msg);
-        }
-        else if let ClusterMessage::OmniPaxosMessage(Message::SequencePaxos(
-            PaxosMessage { from: _, to: node_id, msg: PaxosMsg::Decide(Decide { n: _, seq_num: _, decided_idx: _ }) }
-        )) = msg {
-            match &mut self.tester_connection {
-                Some(ref mut connection) => {
-                    if let Err(err) = connection.send(ServerAnswer::Decide(self.node_id, node_id, self.shard_id, msg)) {
-                        warn!("Couldn't send msg to tester: {err}");
-                        self.tester_connection = None;
-                    }
-                }
-                None => warn!("Not connected to tester"),
-            }
         }
         else {
             match self.cluster_id_to_idx(to) {
@@ -193,8 +172,6 @@ impl NetworkTest {
         let (coordinator_message_sender, coordinator_messages) = tokio::sync::mpsc::channel(batch_size);
         let (tester_message_sender, tester_messages) = tokio::sync::mpsc::channel(batch_size);
         let mut network = Self {
-            node_id: config.local.server_id,
-            shard_id: config.local.shard_id,
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
             peer_connections: cluster_connections,
             coordinator_connection: None,
@@ -547,7 +524,6 @@ impl CoordinatorConnection {
 struct TesterConnection {
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
-    outgoing_messages: UnboundedSender<ServerAnswer>,
 }
 
 impl TesterConnection {
@@ -570,7 +546,7 @@ impl TesterConnection {
             }
         });
         // Writer Actor
-        let (message_tx, mut message_rx) = mpsc::unbounded_channel();
+        let (_, mut message_rx) = mpsc::unbounded_channel();
         let writer_task = tokio::spawn(async move {
             let mut buffer = Vec::with_capacity(batch_size);
             while message_rx.recv_many(&mut buffer, batch_size).await != 0 {
@@ -591,15 +567,7 @@ impl TesterConnection {
         TesterConnection {
             reader_task,
             writer_task,
-            outgoing_messages: message_tx,
         }
-    }
-
-    pub fn send(
-        &mut self,
-        msg: ServerAnswer,
-    ) -> Result<(), mpsc::error::SendError<ServerAnswer>> {
-        self.outgoing_messages.send(msg)
     }
 
     fn close(self) {
@@ -618,8 +586,8 @@ pub type FromTesterConnection = Framed<
 pub type ToTesterConnection = Framed<
     FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
     (),
-    ServerAnswer,
-    Bincode<(), ServerAnswer>,
+    ServerMessage,
+    Bincode<(), ServerMessage>,
 >;
 
 pub fn frame_to_tester_connection(
